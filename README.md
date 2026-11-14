@@ -91,10 +91,15 @@ Without a host toolchain, `Dockerfile.build` pins a Rust 1.91 Debian builder wit
 
 ```sh
 docker build -f Dockerfile.build -t llm-pipeline-tools-build:rust1.91 .
+mkdir -p "$HOME/.cache/llm-pipeline-tools-cargo"
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -v "$PWD:/work" llm-pipeline-tools-build:rust1.91 cargo test --locked
+  -e CARGO_HOME=/cargo -e CARGO_BUILD_JOBS=2 -v "$PWD:/work" \
+  -v "$HOME/.cache/llm-pipeline-tools-cargo:/cargo" \
+  llm-pipeline-tools-build:rust1.91 cargo test --locked
 docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-  -v "$PWD:/work" llm-pipeline-tools-build:rust1.91 cargo build --release --locked --bins
+  -e CARGO_HOME=/cargo -e CARGO_BUILD_JOBS=2 -v "$PWD:/work" \
+  -v "$HOME/.cache/llm-pipeline-tools-cargo:/cargo" \
+  llm-pipeline-tools-build:rust1.91 cargo build --release --locked --bins
 ```
 
 Audited workflows require Linux systemd-journald, `libsystemd`, `journalctl`, and their fixed backends. DNS resolution and hostname HTTP/TCP workflows use `dnsx`; passive sources use `subfinder`/`gau`. `RECON_SCOPE` selects an operator-owned absolute policy file; `RECON_REQUIRED_HEADER`/`RECON_REQUIRED_HEADERS` enforce research attribution before HTTP network work. Missing backends, invalid policy and audit failure fail visibly. See [RECON.md](RECON.md) for enforcement, projections and checkpoint resumption.

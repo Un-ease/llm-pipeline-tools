@@ -1,38 +1,86 @@
 # Typed recon workflows
 
-These tools wrap goals, not scanner flags. Requests are typed JSON; unknown fields, malformed domains/URLs, non-integer ports and oversized workloads are rejected before execution. Each CLI prints its input JSON Schema with `--schema`. `recon_mcp` exposes the same workflows as named MCP tools with typed schemas.
+Version **0.2** wraps goals, not scanner switches. Requests are typed JSON; unknown fields, malformed domains/URLs, non-integer ports and oversized workloads are rejected. `--schema` describes each input. Examples are request shapes, not authorization.
 
 ## Workflow surface
 
-|Tool|Input|Result on CLI stdout|
+| Tool | Typed input | Observation |
 |---|---|---|
-|`recon_subdomains`|`{"domain":"example.com"}`|Sorted unique in-scope subdomain strings from passive source enumeration.|
-|`recon_discover`|`{"hosts":["api.example.com"],"ports":[80,443],"paths":["/"]}`|Only observed HTTP endpoints, statuses and compact title/server metadata.|
-|`recon_urls`|`{"domain":"example.com","mode":"archive"}`|Sorted unique URLs from `archive`, `crawl`, or `combined` workflow modes.|
-|`recon_ports`|`{"hosts":["api.example.com"],"ports":[443,8443]}`|Only observed open TCP endpoints, including resolved address and integer port.|
-|`evidence_read`|`{"run":"32-lowercase-hex-id","include_payloads":false}`|Verified event metadata; actual payloads only when explicitly requested.|
-|`evidence_verdict`|`{"run":"32-lowercase-hex-id","verdict":"hypothesis","evidence":[1],"note":"Model interpretation"}`|A separately labeled model verdict, never replacement facts.|
+| `recon_subdomains` | `{"domain":"example.test"}` | Deduplicated passive names, fixed subfinder invocation and source captures. |
+| `recon_resolve` | `{"hosts":["api.example.test"],"domain":"example.test"}` | Compact host/address/CNAME/status/disposition rows; one explicit outcome per unique host. |
+| `recon_discover` | `{"hosts":["api.example.test"],"ports":[443],"paths":["/"]}` | Actual HTTP responses, compact titles/server metadata and honest coverage. |
+| `recon_urls` | `{"domain":"example.test","mode":"archive"}` | Historical URLs; `crawl`/`combined` require explicit seeds. |
+| `recon_ports` | `{"hosts":["api.example.test"],"ports":[443]}` | Actual open TCP endpoints; refusals and operational failures remain distinct. |
+| `evidence_read` | `{"run":"32-lowercase-hex-id","select":{"kind":["http_response"],"status":[404]},"offset":0,"limit":20}` | Full-chain verification followed by compact filtered pagination. |
+| `evidence_verdict` | `{"run":"32-lowercase-hex-id","verdict":"hypothesis","evidence":[1],"note":"Model interpretation"}` | Separately labelled model opinion, never replacement facts. |
 
-Examples show request shapes, not authorization to contact these domains. CLI stdin is a JSON object; no arbitrary scanner arguments, shell expressions, commands, executable paths or report text are accepted in recon tool requests. Responses contain no banner, progress bar or raw scanner dump. A separate one-line stderr receipt identifies the recorded run, final hash, journal cursor and event count.
+No request accepts shell commands, backend executable paths, arbitrary flags, cookies, credentials or per-request headers. Operator settings are not model input.
 
-`recon_discover` defaults to ports `[80,443]` and path `["/"]`; `recon_ports` requires an explicit port list. Ports must be JSON integers in 1..65535, not strings such as `"80,443"`. Up to 32 hosts, 128 ports and 256 host/port pairs are allowed. Discovery additionally accepts up to 64 paths, with at most 256 total host/port/path probes. It uses HTTPS on 443/8443 and HTTP on other ports. This is response discovery, not vulnerability confirmation or a UDP/SYN/banner scan.
+## Breaking v2 result contract
 
-A domain limits discovered names/archived URLs using DNS-label boundaries. It does not establish legal authorization or automatically inherit a bounty program's scope. Supply only authorized assets; program traffic limits and required headers still take precedence. Authenticated scanning and arbitrary request/header injection are intentionally not part of these recon workflows.
+Recon CLI stdout is a compact object, not the old bare array:
 
-## Whole-workflow execution
+```json
+{"v":2,"tool":"recon_subdomains","cols":[],"rows":["a.example.test"],"total":1,"omitted":0,"completeness":"complete","coverage":{},"queue":null}
+```
 
-- **Subdomains:** execute installed `subfinder` once with fixed quiet/structured-output, rate and time settings; capture the command and all observed output; validate scope; normalize and deduplicate names.
-- **Host/content discovery:** resolve supplied hosts, then send bounded GET probes to the specified services/paths. Record resolver outcomes, request intent, response metadata/body and operational failures. HTTP error responses remain observations, not findings.
-- **URLs:** `archive` (default) collects saved historical URLs through installed `gau`; `crawl` requires seeds and performs native exact-origin discovery without requiring gau; `combined` crawls supplied seeds and then collects archives. Archive mode rejects seeds rather than silently ignoring them; crawl/combined require at least one seed. Historical URLs are not asserted live. Crawling is GET-only, bounded to 32 pages/depth two and exact origin including scheme/host/port; no form submission or automatic redirect escape. Linked resources, robots and sitemap references supply candidates. This is not browser execution or exhaustive JS analysis. A required stage failure remains a failure; combined mode does not silently substitute partial success.
-- **Ports:** resolve supplied hosts, perform bounded native TCP connects with 300 ms connection timeouts/concurrency eight, and return only actual opens. Refused, timed-out and operational-error observations remain distinct in evidence.
+Column names appear once for tabular results. CLI defaults to 200 rows and a 24 KiB serialized-row budget; `--limit N` lowers/selects the row bound and `--all` explicitly removes presentation bounds. MCP defaults to 100 rows/24 KiB. `total` and `omitted` always account for the full observation set. Full rows are recorded once as `workflow_result`; terminal events retain completion metadata. CLI stderr contains the run/hash/cursor receipt; MCP includes it in the response object.
 
-For a local crawl: `{"domain":"localhost.localdomain","mode":"crawl","seeds":["http://localhost.localdomain:8080/"]}`. Domain-only archive lookup and seeded native crawling are distinct goals, not individual scanner-flag wrappers. A slow/unavailable archive source therefore does not block an explicitly requested crawl.
+Exit **0** means the bounded workflow finished, not exhaustive asset coverage. Exit **2** means invalid input, unusable/operational failure or unavailable evidence. Exit **3** returns usable but explicitly incomplete observations and a **failure** receipt; MCP marks the same result `isError:true`.
 
-Subfinder and gau are reused rather than reimplemented. Their paths are operator environment settings (`RECON_SUBFINDER`, `RECON_GAU`, absolute paths), not model inputs; otherwise binaries are found on PATH. Missing/failed tools fail visibly. There is no mock, silent empty fallback or arbitrary-flag escape hatch. Captured source-tool output is command evidence, not a claim to have captured its internal provider HTTP traffic.
+On backend timeout, overflow or nonzero exit, only the last newline-complete captured prefix can be parsed. Partial metadata includes captured/parsed/discarded-tail bytes, cutoff reason and backend exit/signal. Raw stdout/stderr remain unchanged in the journal. Zero usable output alone stays an error: partial parsing cannot recover bytes never captured. Completed crawl work can survive a later required archive-stage failure, but the combined run remains failed/partial.
 
-Active HTTP requests use native Rust transport: TLS validation, no ambient proxy or cookie jar, no credentials, no automatic redirects, a bounded timeout/body capture, and conservative request pacing. Captures describe HTTP semantics, not TLS wire packets. Bounded response capture explicitly records truncation instead of pretending the complete body was received. DNS evidence describes system-resolver calls/outcomes, not raw DNS packet capture.
+## Operator scope and research identification
 
-Set operator environment `RECON_HTTP_HEADERS` to a JSON object of required research-identification headers before starting the CLI/MCP server (for example the program's `X-HackerOne` header). Names/values are validated; Host, Authorization, Cookie, Proxy-Authorization, Content-Length, Transfer-Encoding and Connection overrides are forbidden. Effective sent headers are recorded. HTTP pacing is process-wide, not a cross-process traffic governor: multiple CLI instances can aggregate traffic.
+`RECON_SCOPE` selects an **absolute operator-owned JSON file**, never a model-supplied path. The file must be regular, non-symlink, owned by root/current UID and not group/other-writable. The hash covers the exact bytes read.
+
+```json
+{"v":1,"in_scope":{"suffixes":["example.test"],"hosts":[]},"out_of_scope":{"suffixes":[],"hosts":[],"cidrs":[]},"provider_cname_denylist":["vendor.example"],"deny_private_ips":true,"required_headers":{"X-Research":"researcher"},"max_rps":2}
+```
+
+Explicit denies win. Suffixes match DNS-label boundaries. Any denied/private address in a resolution set blocks probing, including IPv4-mapped IPv6; validated addresses are pinned into native HTTP rather than re-resolved at dispatch. Provider CNAME denial is an explicit operator rule, not a guess that every CDN means out-of-scope. Name heuristics never authorize or exclude a host. Scope is policy, **not legal authorization or proof of ownership**.
+
+Private/non-global addresses are denied by default. Authorized internal/loopback work requires an operator policy explicitly setting `deny_private_ips:false`; models cannot override it in requests. `RECON_REQUIRE_SCOPE=1` additionally refuses network workflows without a selected scope. `max_rps` can only lower the built-in two requests/second.
+
+Effective headers come from `RECON_HTTP_HEADERS` (JSON string map). `RECON_REQUIRED_HEADER` names a header that must be present; `RECON_REQUIRED_HEADERS` supplies exact required name/value pairs, merged with scope `required_headers` without conflicts. HTTP workflows fail **before DNS or sockets** when requirements are missing or mismatched. Failure diagnostics expose required names, not values. Actual sent header bytes remain in the protected request evidence. Invalid operator configuration refuses MCP startup.
+
+Host, Authorization, Cookie, Proxy-Authorization, Content-Length, Transfer-Encoding and Connection overrides remain forbidden. Transport is GET-only, TLS-validating, unauthenticated, without ambient proxies/cookie jars or automatic redirects. The 256 KiB body capture explicitly marks truncation and body-read errors.
+
+## DNS, negative observations and limits
+
+`recon_resolve` accepts 1..512 typed hosts. `RECON_DNSX` chooses an absolute DNSx executable (otherwise PATH); hostnames go through a fixed, supervised JSON-producing invocation, never model-controlled switches. Hostname HTTP/TCP workflows also use DNSx so CNAME policy is checked independently of caller claims. Addresses and aliases are observations, not service liveness.
+
+Actual negative DNS answers, empty answers and errors remain distinct. **A backend that emits no row for a host produces `not_observed`, not invented NXDOMAIN/NODATA.** Scope-blocked inputs remain explicit and are not queried. Interrupted resolution retains partial coverage and unknown rows.
+
+Refused TCP connections and observed negative DNS/HTTP responses are valid observations even if `rows` is empty. Timeouts, missing backend output and audit failures do not become fake successful negatives. Coverage reports outcomes and omissions.
+
+Discovery permits 32 hosts, 128 integer ports, 64 paths, at most 256 host/port pairs and 256 HTTP probes. Defaults are ports `[80,443]` and path `["/"]`; ports require an explicit list for TCP checks. HTTPS is used on 443/8443. TCP uses 300 ms connection timeouts/concurrency eight. This is not a SYN/UDP/banner scan or vulnerability confirmation.
+
+Subfinder/gau use fixed source/rate/time arguments and `RECON_SUBFINDER`/`RECON_GAU` absolute paths, otherwise PATH. Supervision bounds runtime to 120 seconds and captured output to 8 MiB. Command captures are not internal provider HTTP or DNS packet captures.
+
+## Crawl scheduling and resumption
+
+`archive` is provider-only and rejects seeds/checkpoints. `crawl` is independent of gau. `combined` requires both stages, preserving any failed stage as incomplete.
+
+Native crawling separates **32 navigation/metadata** requests from **eight JavaScript assets**, depth two, exact seed origin including scheme/host/port. CSS/images/fonts cannot consume navigation budget. Real navigation and robots/sitemaps take priority over script literals. Templates/constants retain provenance as hints but are not blindly requested. Robots exclusions are honored. No forms, browser execution or redirects.
+
+A bounded checkpoint retains pending URL/origin/depth/kind, visited URLs, omission count and scope fingerprint in `workflow_result`. Default pending limit is 512 (`RECON_QUEUE_LIMIT`, maximum 2000); visited history is bounded to 4096. Every omission is explicit. Default output exposes only queue counts and a resume run ID, not hundreds of repeated URLs.
+
+```json
+{"domain":"example.test","mode":"crawl","seeds":["https://app.example.test/"],"resume":"32-lowercase-hex-id"}
+```
+
+Resume reads the verified prior checkpoint internally, revalidates exact origins and current policy, skips visited application content and consumes pending work first. A changed scope fingerprint is rejected before sockets. Robots is refreshed as an explicitly counted safety check, not reused as stale authorization. Inline `queue` checkpoints are also typed/validated; `resume` and `queue` are mutually exclusive. `recon_urls --queue-out PATH` creates a mode-0600 checkpoint export and refuses to overwrite an existing file.
+
+## Lean evidence and observed-set comparison
+
+`evidence_read` intersects `select.kind`, `class`, numeric HTTP `status` and `seq`, then applies `offset`/`limit` (default 100, maximum 4096). An event lacking HTTP status cannot match a status filter. **The entire chain is verified before filtering**, including records outside the selected page.
+
+Responses preserve run-level hash/cursor/attribution plus `run_events`, filtered `events_total`, `events_omitted` and `next_offset`. Compact events retain sequence/kind/class/size and available URL/status/host/outcome summaries. Per-event hash/cursor default off for metadata; `include_integrity` overrides this. `include_payloads:true` is explicit, can be large and defaults integrity on. Original v1 journal facts remain readable.
+
+Subdomains/URLs accept typed `since` or CLI `--since RUN`. The prior completed run must be the same workflow/domain/mode/seeds. Full snapshots remain in the journal; the presentation emits new identities with `new`/`gone`/`unchanged` counts. Partial current results or changed policy cannot establish `gone`, which becomes null. These are observation-set differences, **not live/dead claims or a freshness cache**.
+
+Offline `bbp-urls --site DOMAIN` filters exact domain/subdomains on label boundaries, not PSL/eTLD inference or authorization. Its `--since FILE` rejects truncated/delta baselines. `bbp-routes` collapses locales, parameter templates and identifier segments while preserving origins, query names and real leaf operations; static/noise classes and bounded variants/provenance remain explicit. `bbp-http --group-metadata` groups body-less compatible metadata only, with `equal_bodies:false`; it never replaces body hashes with status/length guesses.
 
 ## Evidence, not model-authored facts
 
@@ -52,27 +100,50 @@ Facts include validated input, command arguments and exact captured stdout/stder
 
 ## MCP integration
 
-Run `dist/recon_mcp` as an MCP stdio server. It advertises exactly the four workflow tools and two evidence tools above; input schemas use `additionalProperties:false` and real integer port arrays. Tool replies have one compact text payload containing results and the evidence receipt, not duplicated text/structured copies. Requests are bounded to 64 KiB. The server accepts standard initialize, ping, tools/list and tools/call messages.
+`dist/recon_mcp` serves **five workflows and two evidence tools** over MCP stdio, using strict schemas and one compact text response rather than duplicated structured/text payloads. Requests remain bounded to 64 KiB. Calls are serialized; the client must allow supervised backend runtime. The installed timeout is 20 minutes.
 
-MCP workflow arrays are previews: at most **100 rows / 24 KiB of serialized array data**, with explicit `total`/`omitted` fields. Default evidence metadata applies the same bound and reports `events_total`/`events_omitted`. Full results remain in the protected journal and normal CLI output; presentation limits do not change recorded facts. Explicit `include_payloads:true` requests remain full and can be large.
+The user registration remains in `~/.omp/agent/mcp.json`; Reflex is preserved. Operator settings must be present **before server startup**:
 
-Calls are currently serialized, without cancellation support. Passive supervision can take 120 seconds; large native batches can take longer, and system-resolver duration is OS-controlled. Configure the client timeout for the selected workload and use conservative batch sizes; a short default tool timeout is not suitable for every workflow.
-
-The default omp profile now registers server `recon` in `~/.omp/agent/mcp.json`, preserving the existing Reflex entry. The registration pins the project working directory and absolute subfinder/gau paths, with a 1,200,000 ms (20-minute) request timeout. Executable reference:
-
-```json
-{"command":"/home/un-ease/Documents/Projects/llm-pipeline-tools/dist/recon_mcp","args":[]}
+```text
+RECON_DNSX=/absolute/path/to/dnsx
+RECON_SUBFINDER=/absolute/path/to/subfinder
+RECON_GAU=/absolute/path/to/gau
+RECON_SCOPE=/absolute/operator/program.json
+RECON_REQUIRE_SCOPE=1
+RECON_REQUIRED_HEADER=X-Research
+RECON_HTTP_HEADERS={"X-Research":"researcher"}
 ```
 
-CLI example on an explicitly authorized host:
+The selected file binds the server to that program. Before changing programs, the operator must select the appropriate policy and research header requirements; the model cannot choose its own policy. User-owned files are trusted configuration, not isolation from an unrestricted same-UID agent.
 
-```sh
-printf '%s\n' '{"hosts":["127.0.0.1"],"ports":[8080]}' | ./dist/recon_ports
-```
+Linux systemd-journald, `journalctl`, `libsystemd` and the applicable backends are runtime prerequisites for audited workflows; offline tools need none of them. Builds additionally require Rust 2024 and `libsystemd-dev`; the pinned `Dockerfile.build` supports machines without a host toolchain. Binaries are not installed into PATH.
 
-Linux, systemd-journald, `journalctl` and `libsystemd` are runtime prerequisites for audited workflows. They are not required for the original offline tool semantics. Executables remain outside PATH; omp launches the registered stdio server. Run `/mcp reload` in an existing conversation, or start a new omp process, to load the registration.
+After replacing binaries/configuration, run `/mcp reload` or start a new omp session. An already-running server does not inherit later environment edits.
 
-## Verification
+## Version 0.2 verification
+
+The pinned Docker builder completed the integrated suite: **195 passed, zero failed, six ignored entries**. All **14 release binaries** were compiled and packaged with refreshed `dist/SHA256SUMS`.
+
+An actual CLI smoke exposed DNS object rows paired with tabular column labels. The output was corrected to compact arrays; all seven affected DNS tests passed afterward and the release binaries were rebuilt. Unaffected successful suites were not repeated.
+
+The packaged CLI/MCP surfaces were exercised with synthetic source backends and actual loopback HTTP/TCP, not bounty targets:
+
+| Scenario | Observed result |
+|---|---|
+| CLI presentation | 10 rows shown out of 314; 304 explicitly omitted. |
+| Journal-backed `--since` | A 315-row current set compared against the full 314-row saved snapshot yielded one new row, not a comparison against its limited preview. |
+| Interrupted backend | Three complete rows retained, incomplete tail excluded, exit 3 and a verified failure terminal; an unusable prefix stayed exit 2 with no fake output. |
+| Required headers/private address | Missing attribution performed no request/backend-resolution work; proper attribution reached the local server; private-address policy prevented contact. |
+| Negative DNS/TCP | NXDOMAIN remained distinct from `not_observed`; an actual local TCP refusal returned empty open rows with an explicit refusal outcome. |
+| Evidence projection | One selected HTTP response occupied 1,207 bytes while preserving run integrity and filtered totals. |
+| Crawl resume | First run made 40 requests; continuation made 18, with zero repeated content requests and one explicitly refreshed robots document. |
+| MCP preview | Seven tools advertised; a 100-of-314 subdomain response occupied 2,558 bytes. |
+| Installed profile | A fresh process started successfully with the saved operator scope/header configuration. |
+| Offline reducers | Site-boundary filtering, query-value-independent URL deltas, distinct account-operation route families and metadata grouping without body-equality claims all passed actual CLI scenarios. |
+
+Local build/smoke outputs and native receipts are indexed in `target/verification-*.log` and `target/verification-smoke.json`. The first smoke failure is retained separately. These local summaries are not replacements for journal facts. The historical external gau timeout below was not retried or relabelled successful.
+
+## Historical version 0.1 verification
 
 Following the requested correctness review, `cargo test --locked --quiet` passed **126 tests**. Four ignored harness entries are subprocess fixtures explicitly launched by nonignored runner tests, not skipped behavioral assertions. Cargo emitted unused test-helper warnings; no test failed.
 

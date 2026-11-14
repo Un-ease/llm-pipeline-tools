@@ -17,9 +17,12 @@ pub struct Resolution {
 }
 impl Resolution {
     fn row(&self, host: &str, policy: &Policy) -> Value {
-        json!({"host":host,"a":self.ips.iter().filter(|ip| ip.is_ipv4()).map(ToString::to_string).collect::<Vec<_>>(),
-            "aaaa":self.ips.iter().filter(|ip| ip.is_ipv6()).map(ToString::to_string).collect::<Vec<_>>(),
-            "cname":self.cnames,"status":self.status,"disposition":policy.disposition(host,&self.ips,&self.cnames)})
+        let a = self.ips.iter().filter(|ip| ip.is_ipv4()).map(|ip| Value::String(ip.to_string())).collect();
+        let aaaa = self.ips.iter().filter(|ip| ip.is_ipv6()).map(|ip| Value::String(ip.to_string())).collect();
+        let cname = self.cnames.iter().map(|name| Value::String(name.clone())).collect();
+        Value::Array(vec![Value::String(host.into()), Value::Array(a), Value::Array(aaaa),
+            Value::Array(cname), Value::String(self.status.clone()),
+            Value::String(policy.disposition(host,&self.ips,&self.cnames).into())])
     }
 }
 fn strings(value: &Value, name: &str) -> Result<Vec<String>> {
@@ -129,7 +132,7 @@ fn prepare(input: &ResolveInput, policy: &Policy) -> (BTreeMap<String,Value>,Vec
     for host in &input.hosts {
         if requested.insert(host.as_str().to_owned(),()).is_some() { continue; }
         if !policy.permits_host(host.as_str()) {
-            rows.insert(host.as_str().to_owned(),json!({"host":host,"a":[],"aaaa":[],"cname":[],"status":"not_queried","disposition":"blocked_host"}));
+            rows.insert(host.as_str().to_owned(),json!([host,[],[],[],"not_queried","blocked_host"]));
         } else if let Ok(ip) = host.as_str().parse::<IpAddr>() {
             rows.insert(host.as_str().to_owned(),Resolution { ips:vec![ip],cnames:Vec::new(),status:"ip_literal".into() }.row(host.as_str(),&policy));
         } else { queried.push(host.clone()); }
@@ -141,10 +144,10 @@ fn assemble(mut rows: BTreeMap<String,Value>, queried: &[Host], observed: BTreeM
     for host in queried {
         rows.insert(host.as_str().to_owned(),match observed.get(host.as_str()) {
             Some(resolution) => resolution.row(host.as_str(),policy),
-            None => json!({"host":host,"a":[],"aaaa":[],"cname":[],"status":"not_observed","disposition":"unknown"}),
+            None => json!([host,[],[],[],"not_observed","unknown"]),
         });
     }
-    let statuses = rows.values().fold(BTreeMap::<String,usize>::new(),|mut counts,row| { *counts.entry(row["status"].as_str().unwrap_or("unknown").to_owned()).or_default() += 1; counts });
+    let statuses = rows.values().fold(BTreeMap::<String,usize>::new(),|mut counts,row| { *counts.entry(row[4].as_str().expect("fixed DNS status column").to_owned()).or_default() += 1; counts });
     let mut result = WorkflowResult::complete(rows.into_values().collect());
     result.cols = vec!["host","a","aaaa","cname","status","disposition"];
     result.coverage = json!({"requested_unique":result.rows.len(),"queried":queried.len(),"observed_dns":observed_count,
@@ -168,16 +171,16 @@ mod tests {
     #[test]
     fn silent_success_is_not_fabricated_negative_dns() {
         let result = project(b"",None);
-        assert!(result.rows.iter().all(|row| row["status"] == "not_observed"));
+        assert!(result.rows.iter().all(|row| row[4] == "not_observed"));
         assert_eq!(result.coverage["not_observed"],3);
         assert_eq!(result.coverage["observed_dns"],0);
     }
     #[test]
     fn explicit_negatives_and_silent_absence_remain_distinct() {
         let result = project(b"{\"host\":\"a.example.test\",\"status_code\":\"NXDOMAIN\"}\n{\"host\":\"b.example.test\",\"status_code\":\"NOERROR\"}\n",None);
-        assert_eq!(result.rows[0]["status"],"nxdomain");
-        assert_eq!(result.rows[1]["status"],"nodata");
-        assert_eq!(result.rows[2]["status"],"not_observed");
+        assert_eq!(result.rows[0][4],"nxdomain");
+        assert_eq!(result.rows[1][4],"nodata");
+        assert_eq!(result.rows[2][4],"not_observed");
         assert_eq!(result.coverage["observed_dns"],2);
         assert_eq!(result.coverage["not_observed"],1);
         assert!(result.partial.is_none());
@@ -185,10 +188,10 @@ mod tests {
     #[test]
     fn positive_answers_keep_all_addresses_and_provider_disposition() {
         let result = project(b"{\"host\":\"a.example.test\",\"a\":[\"8.8.8.8\",\"1.1.1.1\"],\"aaaa\":[\"2606:4700:4700::1111\"],\"cname\":[\"tenant.provider.test\"],\"status_code\":\"NOERROR\"}\n",None);
-        assert_eq!(result.rows[0]["a"],json!(["1.1.1.1","8.8.8.8"]));
-        assert_eq!(result.rows[0]["aaaa"],json!(["2606:4700:4700::1111"]));
-        assert_eq!(result.rows[0]["disposition"],"blocked_cname");
-        assert_eq!(result.rows[0]["status"],"resolved");
+        assert_eq!(result.rows[0][1],json!(["1.1.1.1","8.8.8.8"]));
+        assert_eq!(result.rows[0][2],json!(["2606:4700:4700::1111"]));
+        assert_eq!(result.rows[0][5],"blocked_cname");
+        assert_eq!(result.rows[0][4],"resolved");
     }
     #[test]
     fn interrupted_results_keep_observations_and_unobserved_hosts() {
@@ -196,24 +199,24 @@ mod tests {
             discarded_tail_bytes:50,backend_exit:None,backend_signal:Some(9) };
         let result = project(b"{\"host\":\"a.example.test\",\"status_code\":\"NXDOMAIN\"}\n",Some(partial));
         assert_eq!(result.rows.len(),3);
-        assert_eq!(result.rows[0]["status"],"nxdomain");
-        assert_eq!(result.rows[1]["status"],"not_observed");
+        assert_eq!(result.rows[0][4],"nxdomain");
+        assert_eq!(result.rows[1][4],"not_observed");
         assert_eq!(result.partial.unwrap().cutoff_reason,"timeout");
         assert_eq!(result.coverage["backend_complete"],false);
     }
     #[test]
     fn dns_operational_errors_are_observed_but_not_complete_success() {
         let result = project(b"{\"host\":\"a.example.test\",\"status_code\":\"SERVFAIL\"}\n{\"host\":\"b.example.test\",\"error\":\"timeout\"}\n",None);
-        assert_eq!(result.rows[0]["status"],"servfail");
-        assert_eq!(result.rows[1]["status"],"error");
-        assert_eq!(result.rows[2]["status"],"not_observed");
+        assert_eq!(result.rows[0][4],"servfail");
+        assert_eq!(result.rows[1][4],"error");
+        assert_eq!(result.rows[2][4],"not_observed");
         assert_eq!(result.partial.unwrap().cutoff_reason,"dns_error");
     }
     #[test]
     fn policy_blocked_inputs_never_enter_the_backend_host_list() {
         let input = ResolveInput { hosts:vec![Host::parse("a.example.test").unwrap(),Host::parse("elsewhere.test").unwrap(),Host::parse("a.example.test").unwrap()],domain:None };
         let (rows,queried) = prepare(&input,&policy());
-        assert_eq!(rows["elsewhere.test"]["status"],"not_queried");
+        assert_eq!(rows["elsewhere.test"][4],"not_queried");
         assert_eq!(queried.len(),1);
         assert_eq!(queried[0].as_str(),"a.example.test");
     }

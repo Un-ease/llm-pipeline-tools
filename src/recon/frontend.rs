@@ -85,9 +85,9 @@ fn recorded_result(tool: &str, run: &str, complete: bool) -> Result<(Value, Valu
 fn compare_sets(current: &mut Value, baseline: &Value, run: &str, hash: &Value) -> Result<Value> {
     use std::collections::BTreeSet;
     let before: BTreeSet<&str> = baseline["rows"].as_array().ok_or("prior result has no rows")?
-        .iter().map(|row|row.as_str().ok_or("set comparison requires string rows")).collect::<Result<_>>()?;
+        .iter().map(|row|row.as_str().ok_or("set comparison requires string rows")).collect::<std::result::Result<_,_>>()?;
     let rows = current["rows"].as_array().ok_or("current result has no rows")?;
-    let after: BTreeSet<&str> = rows.iter().map(|row|row.as_str().ok_or("set comparison requires string rows")).collect::<Result<_>>()?;
+    let after: BTreeSet<&str> = rows.iter().map(|row|row.as_str().ok_or("set comparison requires string rows")).collect::<std::result::Result<_,_>>()?;
     let unchanged = after.intersection(&before).count();
     let new_rows: Vec<Value> = after.difference(&before).map(|row|json!(row)).collect();
     let comparable = current["completeness"]=="complete"

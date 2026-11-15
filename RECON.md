@@ -119,13 +119,13 @@ The user registration remains in `~/.omp/agent/mcp.json`; Reflex is preserved. O
 RECON_DNSX=/absolute/path/to/dnsx
 RECON_SUBFINDER=/absolute/path/to/subfinder
 RECON_GAU=/absolute/path/to/gau
-RECON_SCOPE=/absolute/operator/program.json
-RECON_REQUIRE_SCOPE=1
 RECON_REQUIRED_HEADER=X-Research
 RECON_HTTP_HEADERS={"X-Research":"researcher"}
 ```
 
-The selected file binds the server to that program. Before changing programs, the operator must select the appropriate policy and research header requirements; the model cannot choose its own policy. User-owned files are trusted configuration, not isolation from an unrestricted same-UID agent.
+`RECON_SCOPE` is optional; the local MCP registration leaves it and `RECON_REQUIRE_SCOPE` unset. Without a file, no program allowlist, explicit denylist or provider-CNAME exclusion is enforced. Private/non-global address blocking, fixed limits, audit logging and configured required headers still apply. Requests must still stay within authorized targets.
+
+To opt into program-file enforcement, set `RECON_SCOPE=/absolute/operator/program.json` and `RECON_REQUIRE_SCOPE=1`. The selected file binds the server to that program. Before changing programs, select the appropriate policy and research header requirements; the model cannot choose its own policy. User-owned files are trusted configuration, not isolation from an unrestricted same-UID agent.
 
 Linux systemd-journald, `journalctl` and `libsystemd` are runtime prerequisites for audited workflows; network goals also require their applicable backends. `recon_surface` needs the journal but no scanner backend. Offline `bbp-*` reducers and `tok-log` need none of them. Builds additionally require Rust 2024 and `libsystemd-dev`; the pinned `Dockerfile.build` supports machines without a host toolchain. Binaries are not installed into PATH.
 

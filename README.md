@@ -1,6 +1,6 @@
 # LLM pipeline tools
 
-Rust tools for typed, audited recon workflows and compact offline evidence reduction. No AI API is required. Sources and release binaries live here, separately from BBP projects. Offline commands never contact targets; recon workflows perform explicitly requested network work and record their observations.
+Rust tools for typed, audited recon workflows and compact offline evidence reduction. No AI API is required. Sources and release binaries live here, separately from BBP projects. Offline reduction and saved-evidence views never contact targets; network workflows perform explicitly requested work and record their observations.
 
 ## Offline reduction tools
 
@@ -15,7 +15,9 @@ Rust tools for typed, audited recon workflows and compact offline evidence reduc
 
 ## Typed recon workflows
 
-`recon_subdomains`, `recon_resolve`, `recon_discover`, `recon_urls`, and `recon_ports` wrap workflows with typed JSON inputs, not backend switches. **Version 0.2 uses the breaking v2 result contract:** bounded `rows`, `total`, `omitted`, `completeness`, coverage and a journal receipt; old bare-array consumers must migrate. `recon_mcp` exposes five workflows plus two evidence tools. Interrupted usable backend output exits **3**, retains a failure receipt, and is never labelled complete.
+`recon_subdomains`, `recon_resolve`, `recon_discover`, `recon_urls`, and `recon_ports` wrap network goals with typed JSON inputs, not backend switches. `recon_surface` maps verified saved URL evidence without new requests. **Version 0.3 retains the breaking v2 result contract:** bounded `rows`, `total`, `omitted`, `completeness`, coverage and a journal receipt; old bare-array consumers must migrate. `recon_mcp` exposes six workflows plus two evidence tools. Interrupted usable backend output exits **3**, retains a failure receipt, and is never labelled complete.
+
+Chain saved work by receipt: `recon_resolve` accepts `source_run` from a completed subdomain run instead of a copied host list. `recon_surface` accepts a URL-run receipt, defaults to 20 origin/path groups and supports `prefix` zoom into detailed families. It reports historical captures separately from unknown current liveness, authentication state and API operations.
 
 Facts go to the root-owned system journal; model verdicts are appended separately. This protects existing records against ordinary user edits, not root, journal retention, or forged new entries. See [RECON.md](RECON.md) for exact guarantees, input schemas, limits and integration.
 
@@ -64,7 +66,7 @@ For stdin, pipe a saved file into a command with `-`. In automation, preserve th
 - **HTTP:** actual body fingerprints, not equal length/status or a 400-character prefix. Metadata-only observations are not proof of equal bodies. Record references identify parsed records, not necessarily physical lines. Aura request captures do not establish execution success.
 - **GraphQL:** exact saved-type/member lookup, not full query validation, auth testing or live schema discovery. Missing saved fields can reflect incomplete/stale introspection. Selected arguments/input fields require saved `defaultValue` metadata (string or null); missing/invalid metadata fails instead of guessing requiredness or defaults. Default values, descriptions and response data are not emitted.
 - **URLs:** literal extraction, not JavaScript execution. Query values are discarded, repeated names retained. Exact paths retain spelling. `--host` is an exact filter; `--site` is a DNS-label suffix filter, **not** public-suffix/eTLD inference or authorization. `--since` compares complete saved observation sets, not live/dead status, and rejects limited or delta baselines.
-- **Routes:** normalized families are hypotheses, not live endpoints. Origin and real leaf operations remain distinct; variants/provenance are bounded with explicit omission counts. Source-supplied live tags are not independently verified.
+- **Routes:** normalized families are hypotheses, not live endpoints. Origin and real leaf operations remain distinct; variants/provenance are bounded with explicit omission counts. Trailing-slash variants share an inferred family, not asserted HTTP equivalence. `inferred_count` and `asserted_live_count` are integers, replacing the ambiguous `inferred`/`asserted_live` output labels; the input `asserted_live` tag remains boolean and is not independently verified. Symbol-only mined literals can be noise; numeric identifiers and supported navigation remain candidates.
 - **Metadata grouping:** `bbp-http --group-metadata` is opt-in; equal status/length/MIME is not equal content. Metadata groups expose `equal_bodies:false`; insufficient body evidence is never promoted to complete-body equality.
 - **Evidence:** SHA-256 of complete eligible files, never prefixes. Default hash-size cap: **16 MiB** (`--max-file-bytes N`). Larger files are inventoried but skipped for hashing, not asserted unique. Symlinks are not followed. `.git`, `node_modules`, `target`, and `__pycache__` directories are excluded and counted. No evidence is deleted. Run against a stable snapshot: concurrent file changes can invalidate an inventory.
 - **Logs:** exact lines by default; `--strip-time` is explicit lossy normalization and leaves impossible calendar dates intact. Different identifiers/numbers are not merged. Stack lines remain individual lines; no root-cause, severity or server-health conclusion is inferred. Snippet truncation is counted and full-line SHA-256 retained.
@@ -75,14 +77,17 @@ For stdin, pipe a saved file into a command with `-`. In automation, preserve th
 Requires a Rust 2024-capable toolchain and a C linker to build; compiled executables do not require Rust. Cargo downloads dependencies on the first build. `Cargo.lock` pins the verified resolution.
 
 ```sh
+set -eu
 cargo test --locked
 cargo build --release --locked --bins
 mkdir -p dist
-cp target/release/bbp-http target/release/bbp-gql target/release/bbp-urls \
-   target/release/bbp-routes target/release/bbp-evidence target/release/tok-log dist/
-cp target/release/recon_subdomains target/release/recon_resolve \
-   target/release/recon_discover target/release/recon_urls target/release/recon_ports \
-   target/release/recon_mcp target/release/evidence_read target/release/evidence_verdict dist/
+for bin in bbp-http bbp-gql bbp-urls bbp-routes bbp-evidence tok-log \
+           recon_subdomains recon_resolve recon_discover recon_urls recon_surface \
+           recon_ports recon_mcp evidence_read evidence_verdict; do
+  staged=$(mktemp "dist/.${bin}.XXXXXX")
+  install -m 755 "target/release/$bin" "$staged"
+  mv -f "$staged" "dist/$bin"
+done
 ```
 
 Release builds use thin LTO and stripped symbols. The delivered Linux x86-64 executables use the system C runtime; they are standalone executables, not promised fully static or cross-platform builds. They are not installed into PATH. The default omp profile registers `recon_mcp` as server `recon`; the existing Reflex configuration is preserved. Run `/mcp reload` or start a new omp session to load it.

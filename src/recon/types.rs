@@ -163,12 +163,39 @@ impl UrlsInput {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ResolveInput { pub hosts: Vec<Host>, #[serde(default)] pub domain: Option<Domain> }
+pub struct ResolveInput {
+    #[serde(default)] pub hosts: Vec<Host>,
+    #[serde(default)] pub domain: Option<Domain>,
+    #[serde(default)] pub source_run: Option<String>,
+}
 impl ResolveInput {
     pub fn validate(&self) -> Result<()> {
-        if self.hosts.is_empty() || self.hosts.len() > 512 { return Err("resolution requires 1..512 hosts".into()); }
+        if let Some(run) = &self.source_run {
+            validate_run(run)?;
+            if !self.hosts.is_empty() { return Err("provide hosts or source_run, not both".into()); }
+        } else if self.hosts.is_empty() || self.hosts.len() > 512 { return Err("resolution requires 1..512 hosts or a source_run".into()); }
         if let Some(domain) = &self.domain {
             if self.hosts.iter().any(|host| !domain.contains_host(host.as_str())) { return Err("resolution host is outside the requested domain".into()); }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceInput {
+    pub run: String,
+    #[serde(default)] pub site: Option<Domain>,
+    #[serde(default)] pub prefix: Option<String>,
+}
+impl SurfaceInput {
+    pub fn validate(&self) -> Result<()> {
+        validate_run(&self.run)?;
+        if let Some(prefix) = &self.prefix {
+            if !prefix.starts_with('/') || prefix.starts_with("//") || prefix.len() > 2048
+                || prefix.contains(['?', '#', '\\']) || prefix.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err("surface prefix must be a bounded absolute path, not an authority, query or fragment".into());
+            }
         }
         Ok(())
     }

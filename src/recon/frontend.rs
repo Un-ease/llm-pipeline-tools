@@ -1,11 +1,11 @@
-use super::{audit::{Audit, Receipt}, network, passive, policy, resolve, types::*};
+use super::{audit::{Audit, Receipt}, network, passive, policy, resolve, saved, surface, types::*};
 use crate::Result;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Read, Write};
 
 const MAX_REQUEST: usize = 65536;
-const TOOLS: [&str;7] = ["recon_subdomains","recon_resolve","recon_discover","recon_urls","recon_ports","evidence_read","evidence_verdict"];
+const TOOLS: [&str;8] = ["recon_subdomains","recon_resolve","recon_discover","recon_urls","recon_surface","recon_ports","evidence_read","evidence_verdict"];
 
 pub fn schema(tool: &str) -> Value {
     let domain = json!({"type":"string","format":"hostname","minLength":3,"maxLength":254,"description":"ASCII DNS domain, not a URL, wildcard, IP or command"});
@@ -24,11 +24,13 @@ pub fn schema(tool: &str) -> Value {
         "recon_resolve" => {
             let mut resolve_hosts = hosts;
             resolve_hosts["maxItems"] = json!(512);
-            (json!({"hosts":resolve_hosts,"domain":domain}),json!(["hosts"]))
+            resolve_hosts["minItems"] = json!(0);
+            (json!({"hosts":resolve_hosts,"domain":domain,"source_run":run}),json!([]))
         },
         "recon_discover" => (json!({"hosts":hosts,"ports":ports,"paths":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","pattern":"^/(?!/)","maxLength":2048},"default":["/"]}}),json!(["hosts"])),
         "recon_ports" => (json!({"hosts":hosts,"ports":ports}),json!(["hosts","ports"])),
         "recon_urls" => (json!({"domain":domain,"mode":{"type":"string","enum":["archive","crawl","combined"],"default":"archive"},"seeds":{"type":"array","maxItems":8,"default":[],"items":{"type":"string","format":"uri","maxLength":8192}},"since":run,"resume":run,"queue":checkpoint}),json!(["domain"])),
+        "recon_surface" => (json!({"run":run,"site":domain,"prefix":{"type":"string","pattern":"^/(?!/)","maxLength":2048,"description":"Optional route prefix to zoom into, not a URL or request target"}}),json!(["run"])),
         "evidence_read" => (json!({"run":run,"include_payloads":{"type":"boolean","default":false},"include_integrity":{"type":"boolean"},
             "select":{"type":"object","additionalProperties":false,"properties":{
                 "kind":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":96}},
@@ -42,6 +44,12 @@ pub fn schema(tool: &str) -> Value {
     };
     let mut result = json!({"type":"object","additionalProperties":false,"properties":properties,"required":required});
     if tool=="recon_discover" { result["properties"]["ports"]["default"] = json!([80,443]); }
+    if tool=="recon_resolve" {
+        result["oneOf"] = json!([
+            {"required":["hosts"],"properties":{"hosts":{"minItems":1}},"not":{"required":["source_run"]}},
+            {"required":["source_run"],"properties":{"hosts":{"maxItems":0}}}
+        ]);
+    }
     if tool=="recon_urls" {
         result["allOf"] = json!([
             {"oneOf":[
@@ -62,25 +70,6 @@ struct Failed { error: String, receipt: Option<Receipt> }
 impl From<String> for Failed { fn from(error:String) -> Self { Self{error,receipt:None} } }
 impl From<&str> for Failed { fn from(error:&str)->Self { Self::from(error.to_owned()) } }
 
-fn recorded_result(tool: &str, run: &str, complete: bool) -> Result<(Value, Value)> {
-    let mut request = ReadInput::full(run.into());
-    request.select.kind = vec!["request".into(),"workflow_result".into(),"complete".into(),"failure".into()];
-    let evidence = Audit::read(&request)?;
-    if !matches!(evidence["status"].as_str(),Some("complete"|"failure")) { return Err("prior receipt has no verified terminal outcome".into()); }
-    if evidence["tool"] != tool || (complete && evidence["status"] != "complete") {
-        return Err("prior receipt must identify a completed run of the same workflow".into());
-    }
-    let events = evidence["events"].as_array().ok_or("prior run has no verified events")?;
-    let facts = events.iter().rev().find(|event| event["kind"]=="workflow_result")
-        .and_then(|event| event.get("data")).ok_or("prior run has no retained workflow result")?;
-    let payload = if facts["v"]==2 && facts["rows"].is_array() {
-        facts.clone()
-    } else if facts["tool"]==tool && facts["items"].is_array() {
-        // Read-only support for facts recorded before the v2 result cutover.
-        json!({"rows":facts["items"],"completeness":"complete","coverage":{}})
-    } else { return Err("prior workflow result has an unsupported schema".into()); };
-    Ok((evidence,payload))
-}
 
 fn compare_sets(current: &mut Value, baseline: &Value, run: &str, hash: &Value) -> Result<Value> {
     use std::collections::BTreeSet;
@@ -114,37 +103,39 @@ fn execute(tool: &str, input: Value) -> std::result::Result<Complete, Failed> {
         let receipt=Audit::verdict(&request)?;
         return Ok(Complete{result:json!({"verdict":request.verdict,"model_supplied":true}),receipt:Some(receipt)});
     }
-    enum Request { Subdomains(SubdomainsInput), Resolve(ResolveInput), Discover(DiscoverInput), Urls(UrlsInput), Ports(PortsInput) }
+    enum Request { Subdomains(SubdomainsInput), Resolve(ResolveInput), Discover(DiscoverInput), Urls(UrlsInput), Surface(SurfaceInput), Ports(PortsInput) }
     let mut request = match tool {
         "recon_subdomains" => { let r:SubdomainsInput=parse(input)?; r.validate()?; Request::Subdomains(r) },
         "recon_resolve" => { let r:ResolveInput=parse(input)?; r.validate()?; Request::Resolve(r) },
         "recon_discover" => { let r:DiscoverInput=parse(input)?; r.validate()?; Request::Discover(r) },
         "recon_urls" => { let r:UrlsInput=parse(input)?; r.validate()?; Request::Urls(r) },
+        "recon_surface" => {let r:SurfaceInput=parse(input)?;r.validate()?;Request::Surface(r)},
         "recon_ports" => { let r:PortsInput=parse(input)?; r.validate()?; Request::Ports(r) },
         _ => return Err(format!("unknown workflow {tool}").into()),
     };
     let canonical = match &request {
         Request::Subdomains(r)=>serde_json::to_value(r),Request::Resolve(r)=>serde_json::to_value(r),
-        Request::Discover(r)=>serde_json::to_value(r),Request::Urls(r)=>serde_json::to_value(r),Request::Ports(r)=>serde_json::to_value(r),
+        Request::Discover(r)=>serde_json::to_value(r),Request::Urls(r)=>serde_json::to_value(r),Request::Surface(r)=>serde_json::to_value(r),Request::Ports(r)=>serde_json::to_value(r),
     }.map_err(|e|e.to_string())?;
     let since = match &request { Request::Subdomains(r)=>r.since.as_deref(),Request::Urls(r)=>r.since.as_deref(),_=>None };
     let baseline = since.map(|run| -> Result<_> {
-        let (evidence,payload)=recorded_result(tool,run,true)?;
-        let previous=evidence["events"].as_array().and_then(|events|events.iter().find(|event|event["kind"]=="request"))
-            .and_then(|event|event.pointer("/data/input")).ok_or("prior request metadata is missing")?;
+        let source=saved::load(run,tool)?;
+        source.require_complete()?;
+        let previous=&source.request["input"];
         for key in ["domain","mode","seeds"] {
             if previous.get(key)!=canonical.get(key) { return Err(format!("prior {key} differs; observation sets are not comparable")); }
         }
-        Ok((run.to_owned(),evidence["hash"].clone(),payload))
+        Ok((run.to_owned(),json!(source.hash),source.payload))
     }).transpose()?;
     let resumed = if let Request::Urls(r)=&mut request {
         if let Some(run)=r.resume.take() {
-            let (evidence,payload)=recorded_result(tool,&run,false)?;
-            let queue:CrawlCheckpoint=serde_json::from_value(payload["queue"].clone()).map_err(|e|format!("prior run has no usable crawl checkpoint: {e}"))?;
+            let source=saved::load(&run,tool)?;
+            let reference=json!({"source_run":run,"source_hash":source.hash});
+            let queue:CrawlCheckpoint=serde_json::from_value(source.payload["queue"].clone()).map_err(|e|format!("prior run has no usable crawl checkpoint: {e}"))?;
             queue.validate(&r.seeds)?;
             r.queue=Some(queue);
             r.validate()?;
-            Some(json!({"source_run":run,"source_hash":evidence["hash"]}))
+            Some(reference)
         } else { None }
     } else { None };
     let audit=Audit::start(tool,&canonical)?;
@@ -155,6 +146,7 @@ fn execute(tool: &str, input: Value) -> std::result::Result<Complete, Failed> {
         let mut result = match &request {
             Request::Subdomains(r)=>passive::subdomains(r,&audit),Request::Resolve(r)=>resolve::resolve(r,&audit),
             Request::Discover(r)=>network::discover(r,&audit),Request::Urls(r)=>passive::urls(r,&audit),Request::Ports(r)=>network::ports(r,&audit),
+            Request::Surface(r)=>surface::surface(r,&audit),
         }?;
         result.coverage["scope_file_sha256"]=json!(policy.fingerprint());
         let mut payload=result.into_payload(tool);
@@ -186,12 +178,13 @@ pub fn cli(tool: &str) {
     let result=(|| -> std::result::Result<Complete,Failed> {
         let options=crate::Options::parse(&["--all","--schema"],&["--queue-out","--since"])?;
         if options.help() {
-            println!("{tool}: typed whole-workflow JSON on stdin; --schema prints input schema.\n--limit N (default 200) bounds rows; --all explicitly emits all rows.\n--since RUN compares subdomain/URL observation sets. recon_urls --queue-out PATH creates a checkpoint export.\nResults use v2 rows/total/omitted/completeness; stderr carries the journal receipt.\nExit 0: completed workflow; 3: retained partial backend output with failure receipt; 2: error.\nOperator scope, private-address and required-header policies are enforced; no backend flag passthrough.");
+            let default_limit=if tool=="recon_surface" {20}else{200};
+            println!("{tool}: typed whole-workflow JSON on stdin; --schema prints input schema.\n--limit N (default {default_limit}) bounds rows; --all explicitly emits all rows.\n--since RUN compares subdomain/URL observation sets. recon_urls --queue-out PATH creates a checkpoint export.\nrecon_resolve accepts hosts or source_run; recon_surface reads an existing URL run without target requests.\nResults use v2 rows/total/omitted/completeness; stderr carries the journal receipt.\nExit 0: completed workflow; 3: retained partial output with failure receipt; 2: error.\nOperator scope, private-address and required-header policies remain enforced; no backend flag passthrough.");
             return Ok(Complete{result:Value::Null,receipt:None});
         }
         if !options.inputs.is_empty() { return Err("provide typed JSON on stdin, not positional arguments".to_owned().into()); }
         if options.flag("--schema") { println!("{}",schema(tool)); return Ok(Complete{result:Value::Null,receipt:None}); }
-        let requested_limit=options.number("--limit",200)?;
+        let requested_limit=options.number("--limit",if tool=="recon_surface" {20}else{200})?;
         let limit=if options.flag("--all") {usize::MAX}else{requested_limit};
         let mut bytes=Vec::new();
         io::stdin().take((MAX_REQUEST+1) as u64).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
@@ -299,7 +292,8 @@ fn present(mut result:Value,receipt:Option<&Receipt>,limit:usize,bytes:Option<us
 }
 
 fn mcp_result(result: Value, receipt: Option<Receipt>, metadata_only: bool) -> Value {
-    let mut result=present(result,receipt.as_ref(),MCP_PREVIEW_ROWS,Some(MCP_PREVIEW_BYTES),metadata_only);
+    let limit=if result["tool"]=="recon_surface" {20}else{MCP_PREVIEW_ROWS};
+    let mut result=present(result,receipt.as_ref(),limit,Some(MCP_PREVIEW_BYTES),metadata_only);
     if let Some(receipt)=receipt {result["receipt"]=json!(receipt);}
     result
 }
@@ -310,6 +304,7 @@ fn description(tool:&str)->&str {
         "recon_resolve"=>"Resolve typed hosts and return compact addresses, CNAMEs, explicit observed/unknown outcomes and operator-policy dispositions.",
         "recon_discover"=>"Discover HTTP services/content with operator scope, required research headers and private-address guards.",
         "recon_urls"=>"Discover archived/public URLs; prioritize navigation, separately budget JS assets and resume via a prior receipt.",
+        "recon_surface"=>"Summarize verified saved URL evidence into compact offline route groups; zoom by prefix without rescanning or exporting raw captures.",
         "recon_ports"=>"Check explicit integer TCP ports with operator scope/address guards and honest negative coverage.",
         "evidence_read"=>"Verify the complete journal chain, then filter/page lean observations; payloads and per-event integrity are opt-in.",
         _=>"Append a separately labeled model verdict referencing existing facts; cannot alter evidence.",
@@ -369,7 +364,7 @@ fn frame(reader:&mut impl BufRead)->io::Result<Option<std::result::Result<Vec<u8
 
 pub fn mcp()->Result<()> {
     if std::env::args().skip(1).any(|a|a=="--help" || a=="-h") {
-        println!("recon_mcp: MCP stdio server for five typed recon workflows and two evidence tools. Operator scope/header/address enforcement; no flag passthroughs. Requires systemd-journald.");
+        println!("recon_mcp: MCP stdio server for six typed workflows and two evidence tools, including offline saved-surface mapping. Operator scope/header/address enforcement; no flag passthroughs. Requires systemd-journald.");
         return Ok(());
     }
     if std::env::args().len()!=1 { return Err("recon_mcp accepts no arguments".into()); }

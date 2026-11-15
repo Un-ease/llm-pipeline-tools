@@ -2,6 +2,7 @@ use super::audit::Audit;
 use super::passive::{self, BackendInput};
 use super::policy::Policy;
 use super::result::{PartialInfo, WorkflowResult};
+use super::saved::{self, SavedWorkflow};
 use super::types::{Host, ResolveInput};
 use crate::Result;
 use serde_json::{Value, json};
@@ -121,21 +122,48 @@ pub fn resolve(input: &ResolveInput, audit: &Audit) -> Result<WorkflowResult> {
     let policy = Policy::load()?;
     policy.check_network()?;
     policy.record(audit)?;
-    let (rows,queried) = prepare(input,&policy);
+    let (rows,queried,source_metadata) = if let Some(run) = &input.source_run {
+        let (expanded,metadata) = source_input(input,saved::load(run,"recon_subdomains")?)?;
+        audit.record("workflow_source",&metadata)?;
+        let (rows,queried)=prepare(expanded.hosts,&policy);
+        (rows,queried,Some(metadata))
+    } else {
+        let (rows,queried)=prepare(input.hosts.iter().cloned(),&policy);
+        (rows,queried,None)
+    };
     let (observed, partial) = if queried.is_empty() { (BTreeMap::new(),None) } else { query(&queried,audit)? };
-    assemble(rows,&queried,observed,partial,&policy)
+    let mut result=assemble(rows,&queried,observed,partial,&policy)?;
+    if let Some(metadata)=source_metadata {result.coverage["source"]=metadata;}
+    Ok(result)
 }
-fn prepare(input: &ResolveInput, policy: &Policy) -> (BTreeMap<String,Value>,Vec<Host>) {
+fn source_input(input:&ResolveInput,source:SavedWorkflow)->Result<(ResolveInput,Value)> {
+    source.require_complete()?;
+    if source.tool!="recon_subdomains" || input.source_run.as_deref()!=Some(source.run.as_str()) {
+        return Err("resolution source must be the requested subdomain workflow".into());
+    }
+    if input.domain.as_ref().is_some_and(|domain|domain.as_str()!=source.domain.as_str()) {
+        return Err("requested domain differs from the recorded subdomain domain".into());
+    }
+    let rows=source.payload["rows"].as_array().ok_or("recorded subdomain result has no rows")?;
+    if rows.is_empty() || rows.len()>512 {return Err("recorded subdomain input requires 1..512 hosts; choose a bounded source run".into());}
+    let hosts=rows.iter().map(|row|row.as_str().ok_or_else(||"recorded host row is not a string".to_owned()).and_then(Host::parse)).collect::<Result<Vec<_>>>()?;
+    let metadata=source.metadata();
+    let expanded=ResolveInput{hosts,domain:Some(source.domain),source_run:None};
+    expanded.validate()?;
+    Ok((expanded,metadata))
+}
+
+fn prepare(hosts:impl IntoIterator<Item=Host>, policy: &Policy) -> (BTreeMap<String,Value>,Vec<Host>) {
     let mut requested = BTreeMap::new();
     let mut queried = Vec::new();
     let mut rows = BTreeMap::new();
-    for host in &input.hosts {
+    for host in hosts {
         if requested.insert(host.as_str().to_owned(),()).is_some() { continue; }
         if !policy.permits_host(host.as_str()) {
             rows.insert(host.as_str().to_owned(),json!([host,[],[],[],"not_queried","blocked_host"]));
         } else if let Ok(ip) = host.as_str().parse::<IpAddr>() {
             rows.insert(host.as_str().to_owned(),Resolution { ips:vec![ip],cnames:Vec::new(),status:"ip_literal".into() }.row(host.as_str(),&policy));
-        } else { queried.push(host.clone()); }
+        } else { queried.push(host); }
     }
     (rows,queried)
 }
@@ -214,8 +242,8 @@ mod tests {
     }
     #[test]
     fn policy_blocked_inputs_never_enter_the_backend_host_list() {
-        let input = ResolveInput { hosts:vec![Host::parse("a.example.test").unwrap(),Host::parse("elsewhere.test").unwrap(),Host::parse("a.example.test").unwrap()],domain:None };
-        let (rows,queried) = prepare(&input,&policy());
+        let input = ResolveInput { hosts:vec![Host::parse("a.example.test").unwrap(),Host::parse("elsewhere.test").unwrap(),Host::parse("a.example.test").unwrap()],domain:None,source_run:None };
+        let (rows,queried) = prepare(input.hosts,&policy());
         assert_eq!(rows["elsewhere.test"][4],"not_queried");
         assert_eq!(queried.len(),1);
         assert_eq!(queried[0].as_str(),"a.example.test");
@@ -232,5 +260,43 @@ mod tests {
             b"{\"host\":\"a.example.test\",\"a\":\"1.1.1.1\"}\n",
             b"not JSON\n",
         ] { assert!(parse(bytes,&requested).is_err()); }
+    }
+
+    fn saved_names(count:usize)->SavedWorkflow {
+        let domain=super::super::types::Domain::parse("example.test").unwrap();
+        let rows:Vec<Value>=(0..count).map(|n|json!(format!("n{n}.example.test"))).collect();
+        SavedWorkflow {run:"a".repeat(32),hash:"b".repeat(64),cursor:"fixture".into(),
+            tool:"recon_subdomains".into(),status:"complete".into(),completeness:"complete".into(),
+            domain,request:json!({"tool":"recon_subdomains","input":{"domain":"example.test"},"source":"typed_tool_request"}),
+            payload:json!({"rows":rows}),result_seq:2,observations:Vec::new(),partial:None}
+    }
+
+    fn receipt_input()->ResolveInput {
+        ResolveInput{hosts:Vec::new(),domain:None,source_run:Some("a".repeat(32))}
+    }
+
+    #[test]
+    fn source_expansion_uses_the_complete_snapshot_not_a_preview() {
+        let (expanded,metadata)=source_input(&receipt_input(),saved_names(314)).unwrap();
+        assert_eq!(expanded.hosts.len(),314);
+        assert_eq!(expanded.hosts[313].as_str(),"n313.example.test");
+        assert_eq!(expanded.domain.unwrap().as_str(),"example.test");
+        assert!(expanded.source_run.is_none());
+        assert_eq!(metadata["source_run"],"a".repeat(32));
+    }
+
+    #[test]
+    fn source_selection_rejects_partial_mismatched_or_oversized_inputs() {
+        let mut partial=saved_names(1);
+        partial.status="failure".into();
+        partial.completeness="partial".into();
+        assert!(source_input(&receipt_input(),partial).is_err());
+        for count in [0,513] { assert!(source_input(&receipt_input(),saved_names(count)).is_err()); }
+        let mut other_domain=receipt_input();
+        other_domain.domain=Some(super::super::types::Domain::parse("other.test").unwrap());
+        assert!(source_input(&other_domain,saved_names(1)).is_err());
+        let mut other_run=receipt_input();
+        other_run.source_run=Some("c".repeat(32));
+        assert!(source_input(&other_run,saved_names(1)).is_err());
     }
 }

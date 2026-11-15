@@ -1,15 +1,16 @@
 # Typed recon workflows
 
-Version **0.2** wraps goals, not scanner switches. Requests are typed JSON; unknown fields, malformed domains/URLs, non-integer ports and oversized workloads are rejected. `--schema` describes each input. Examples are request shapes, not authorization.
+Version **0.3** wraps goals, not scanner switches. Requests are typed JSON; unknown fields, malformed domains/URLs, non-integer ports and oversized workloads are rejected. `--schema` describes each input. Examples are request shapes, not authorization; replace example run IDs with actual receipts.
 
 ## Workflow surface
 
 | Tool | Typed input | Observation |
 |---|---|---|
 | `recon_subdomains` | `{"domain":"example.test"}` | Deduplicated passive names, fixed subfinder invocation and source captures. |
-| `recon_resolve` | `{"hosts":["api.example.test"],"domain":"example.test"}` | Compact host/address/CNAME/status/disposition rows; one explicit outcome per unique host. |
+| `recon_resolve` | `{"hosts":["api.example.test"],"domain":"example.test"}` or `{"source_run":"32-lowercase-hex-id"}` | Compact host/address/CNAME/status/disposition rows; one explicit outcome per unique host, with verified source metadata when chained. |
 | `recon_discover` | `{"hosts":["api.example.test"],"ports":[443],"paths":["/"]}` | Actual HTTP responses, compact titles/server metadata and honest coverage. |
 | `recon_urls` | `{"domain":"example.test","mode":"archive"}` | Historical URLs; `crawl`/`combined` require explicit seeds. |
+| `recon_surface` | `{"run":"32-lowercase-hex-id","prefix":"/account/settings"}` | Offline origin/path groups or detailed route families from verified saved URL evidence, with bounded examples and historical capture references. |
 | `recon_ports` | `{"hosts":["api.example.test"],"ports":[443]}` | Actual open TCP endpoints; refusals and operational failures remain distinct. |
 | `evidence_read` | `{"run":"32-lowercase-hex-id","select":{"kind":["http_response"],"status":[404]},"offset":0,"limit":20}` | Full-chain verification followed by compact filtered pagination. |
 | `evidence_verdict` | `{"run":"32-lowercase-hex-id","verdict":"hypothesis","evidence":[1],"note":"Model interpretation"}` | Separately labelled model opinion, never replacement facts. |
@@ -24,7 +25,7 @@ Recon CLI stdout is a compact object, not the old bare array:
 {"v":2,"tool":"recon_subdomains","cols":[],"rows":["a.example.test"],"total":1,"omitted":0,"completeness":"complete","coverage":{},"queue":null}
 ```
 
-Column names appear once for tabular results. CLI defaults to 200 rows and a 24 KiB serialized-row budget; `--limit N` lowers/selects the row bound and `--all` explicitly removes presentation bounds. MCP defaults to 100 rows/24 KiB. `total` and `omitted` always account for the full observation set. Full rows are recorded once as `workflow_result`; terminal events retain completion metadata. CLI stderr contains the run/hash/cursor receipt; MCP includes it in the response object.
+Column names appear once for tabular results. Recon CLI defaults to 200 rows and a 24 KiB serialized-row budget; `--limit N` lowers/selects the row bound and `--all` explicitly removes presentation bounds. MCP defaults to 100 rows/24 KiB. **`recon_surface` defaults to 20 rows in both interfaces.** `total` and `omitted` always account for the full observation set. Full rows are recorded once as `workflow_result`; terminal events retain completion metadata. CLI stderr contains the run/hash/cursor receipt; MCP includes it in the response object.
 
 Exit **0** means the bounded workflow finished, not exhaustive asset coverage. Exit **2** means invalid input, unusable/operational failure or unavailable evidence. Exit **3** returns usable but explicitly incomplete observations and a **failure** receipt; MCP marks the same result `isError:true`.
 
@@ -48,7 +49,7 @@ Host, Authorization, Cookie, Proxy-Authorization, Content-Length, Transfer-Encod
 
 ## DNS, negative observations and limits
 
-`recon_resolve` accepts 1..512 typed hosts. `RECON_DNSX` chooses an absolute DNSx executable (otherwise PATH); hostnames go through a fixed, supervised JSON-producing invocation, never model-controlled switches. Hostname HTTP/TCP workflows also use DNSx so CNAME policy is checked independently of caller claims. Addresses and aliases are observations, not service liveness.
+`recon_resolve` accepts 1..512 typed hosts, or a `source_run` selecting a verified completed `recon_subdomains` snapshot of the same size bound. `RECON_DNSX` chooses an absolute DNSx executable (otherwise PATH); hostnames go through a fixed, supervised JSON-producing invocation, never model-controlled switches. Hostname HTTP/TCP workflows also use DNSx so CNAME policy is checked independently of caller claims. Addresses and aliases are observations, not service liveness.
 
 Actual negative DNS answers, empty answers and errors remain distinct. **A backend that emits no row for a host produces `not_observed`, not invented NXDOMAIN/NODATA.** Scope-blocked inputs remain explicit and are not queried. Interrupted resolution retains partial coverage and unknown rows.
 
@@ -57,6 +58,16 @@ Refused TCP connections and observed negative DNS/HTTP responses are valid obser
 Discovery permits 32 hosts, 128 integer ports, 64 paths, at most 256 host/port pairs and 256 HTTP probes. Defaults are ports `[80,443]` and path `["/"]`; ports require an explicit list for TCP checks. HTTPS is used on 443/8443. TCP uses 300 ms connection timeouts/concurrency eight. This is not a SYN/UDP/banner scan or vulnerability confirmation.
 
 Subfinder/gau use fixed source/rate/time arguments and `RECON_SUBFINDER`/`RECON_GAU` absolute paths, otherwise PATH. Supervision bounds runtime to 120 seconds and captured output to 8 MiB. Command captures are not internal provider HTTP or DNS packet captures.
+
+## Receipt-driven saved inputs and surface views
+
+`recon_resolve` with `source_run` reads the **full recorded snapshot**, not its limited preview or `--since` delta. Nonempty `hosts` and `source_run` are mutually exclusive. An optional `domain` must match the recorded source domain. Partial, empty, oversized, wrong-workflow or inconsistent sources are rejected; oversized snapshots are not silently truncated. Current scope, CNAME and address policy still apply before probing.
+
+`recon_surface` accepts `run` from a saved `recon_urls` workflow, optional DNS-suffix display filter `site`, and optional absolute-path `prefix`. Default rows group inferred route families by origin and first two normalized path segments. A prefix selects detailed families on path boundaries, not substring matches. Static assets and literal noise are excluded from actionable rows but counted. Examples and evidence sequence references have explicit totals and omission counts.
+
+The tool verifies the entire source chain before selecting request/result/completion and compact crawl observations. It does not export raw body/command captures or fall back to mutable files. Captured HTTP statuses belong to the source run: current liveness, authentication states, API operations and object graphs remain unknown. A retained partial source stays partial with its original byte/cutoff facts; legacy sources without bounds retain unknown bounds. This is a navigation aid, not endpoint equivalence or vulnerability confirmation.
+
+Completed v1 facts remain readable, including original completion arrays; any retained terminal rows must match the recorded result. v2 sources still require their v2 completion summary. The same strict saved-workflow reader serves receipt chaining, `--since` and crawl resume.
 
 ## Crawl scheduling and resumption
 
@@ -100,7 +111,7 @@ Facts include validated input, command arguments and exact captured stdout/stder
 
 ## MCP integration
 
-`dist/recon_mcp` serves **five workflows and two evidence tools** over MCP stdio, using strict schemas and one compact text response rather than duplicated structured/text payloads. Requests remain bounded to 64 KiB. Calls are serialized; the client must allow supervised backend runtime. The installed timeout is 20 minutes.
+`dist/recon_mcp` serves **six workflows and two evidence tools** over MCP stdio, using strict schemas and one compact text response rather than duplicated structured/text payloads. Five workflows perform network work; `recon_surface` reads saved evidence only. Requests remain bounded to 64 KiB. Calls are serialized; the client must allow supervised backend runtime. The installed timeout is 20 minutes.
 
 The user registration remains in `~/.omp/agent/mcp.json`; Reflex is preserved. Operator settings must be present **before server startup**:
 
@@ -116,9 +127,26 @@ RECON_HTTP_HEADERS={"X-Research":"researcher"}
 
 The selected file binds the server to that program. Before changing programs, the operator must select the appropriate policy and research header requirements; the model cannot choose its own policy. User-owned files are trusted configuration, not isolation from an unrestricted same-UID agent.
 
-Linux systemd-journald, `journalctl`, `libsystemd` and the applicable backends are runtime prerequisites for audited workflows; offline tools need none of them. Builds additionally require Rust 2024 and `libsystemd-dev`; the pinned `Dockerfile.build` supports machines without a host toolchain. Binaries are not installed into PATH.
+Linux systemd-journald, `journalctl` and `libsystemd` are runtime prerequisites for audited workflows; network goals also require their applicable backends. `recon_surface` needs the journal but no scanner backend. Offline `bbp-*` reducers and `tok-log` need none of them. Builds additionally require Rust 2024 and `libsystemd-dev`; the pinned `Dockerfile.build` supports machines without a host toolchain. Binaries are not installed into PATH.
 
 After replacing binaries/configuration, run `/mcp reload` or start a new omp session. An already-running server does not inherit later environment edits.
+
+## Version 0.3 verification
+
+**77 focused tests passed** across the changed library, routes, frontend, input-validation, saved-workflow and surface paths. After the real legacy-format failure, all **14 saved-reader tests** passed with the corrected fixture and additional contradiction regression; unaffected successful suites were not repeated. All **15 release binaries** were compiled and atomically packaged with refreshed `dist/SHA256SUMS`.
+
+| Scenario | Observed result |
+|---|---|
+| Receipt chaining | A one-row subdomain delta preview referenced a full 315-host saved snapshot; the synthetic DNSx backend processed all 315 without a copied host list. |
+| Partial source guard | A retained partial subdomain source was refused before any DNS-backend invocation. |
+| Legacy saved Whatnot view | 588 result URLs plus compact crawl evidence yielded 141 actionable groups; the default MCP response showed 20, omitted 121 explicitly, and occupied 10,356 bytes. |
+| Account-settings zoom | 13 families, zero omitted, 7,157 response bytes; no captured responses were falsely attributed to those unprobed paths. |
+| Fresh MCP process | Version 0.3.0 advertised eight tools and accepted the existing operator configuration. |
+| Network activity | Saved Whatnot evidence and synthetic local backends only; zero new target requests. |
+
+The first smoke stopped on a driver-only assumption that receipts include a status field. The next exposed an actual compatibility bug: original v1 completion data was an array, not an object. The reader now verifies that array against the recorded result, rejects contradictions, and passed the saved-Whatnot MCP scenario. Completed source-chain checks were not repeated.
+
+Build/test/smoke output is retained in `target/verification-v03-*.log`; original failure logs remain. Derived views reference the unchanged source run/hash and append their own journal receipts. Byte counts are measurements, not AI-token or energy measurements.
 
 ## Version 0.2 verification
 

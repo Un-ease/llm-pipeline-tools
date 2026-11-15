@@ -1,4 +1,5 @@
 pub mod recon;
+pub mod routes;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

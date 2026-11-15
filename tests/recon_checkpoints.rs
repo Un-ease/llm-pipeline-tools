@@ -1,4 +1,4 @@
-use llm_pipeline_tools::recon::types::{CrawlCheckpoint, ResolveInput, UrlsInput};
+use llm_pipeline_tools::recon::types::{CrawlCheckpoint, ResolveInput, SurfaceInput, UrlsInput};
 use serde_json::json;
 
 #[test]
@@ -37,4 +37,26 @@ fn resolve_rejects_cross_domain_input_and_model_policy_overrides() {
     assert!(serde_json::from_value::<ResolveInput>(json!({"hosts":["example.test"],"scope":"arbitrary.json"})).is_err());
     let too_many: ResolveInput = serde_json::from_value(json!({"hosts":vec!["example.test";513]})).unwrap();
     assert!(too_many.validate().is_err());
+}
+
+#[test]
+fn receipt_resolution_is_exclusive_and_does_not_accept_paths_as_run_ids() {
+    let source:ResolveInput=serde_json::from_value(json!({"source_run":"a".repeat(32)})).unwrap();
+    assert!(source.validate().is_ok());
+    for request in [
+        json!({"hosts":["a.example.test"],"source_run":"a".repeat(32)}),
+        json!({"source_run":"../scope.json"}),
+        json!({"hosts":[]})
+    ] {
+        let input:ResolveInput=serde_json::from_value(request).unwrap();
+        assert!(input.validate().is_err());
+    }
+}
+
+#[test]
+fn surface_prefixes_are_paths_not_authorities_or_query_expressions() {
+    for prefix in ["//other.test/","/settings?token=x","/settings#fragment","/has space","/a\\b"] {
+        let input:SurfaceInput=serde_json::from_value(json!({"run":"a".repeat(32),"prefix":prefix})).unwrap();
+        assert!(input.validate().is_err());
+    }
 }

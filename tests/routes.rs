@@ -126,8 +126,8 @@ fn variants_and_provenance_are_bounded_with_counts_and_unverified_live_assertion
     assert_eq!(report["total"], 1);
     let row = &report["rows"][0];
     assert_eq!(cell(&report, row, "count"), 9);
-    assert_eq!(cell(&report, row, "inferred"), 7);
-    assert_eq!(cell(&report, row, "asserted_live"), 2);
+    assert_eq!(cell(&report, row, "inferred_count"), 7);
+    assert_eq!(cell(&report, row, "asserted_live_count"), 2);
     assert_eq!(cell(&report, row, "variants").as_array().unwrap().len(), 5);
     assert_eq!(cell(&report, row, "variants_total"), 8);
     assert_eq!(cell(&report, row, "variants_omitted"), 3);
@@ -251,4 +251,41 @@ fn regional_locales_and_parameter_spellings_are_equivalent() {
     let row = &report["rows"][0];
     assert_eq!(cell(&report, row, "route"), "/accounts/:param/settings");
     assert_eq!(cell(&report, row, "count"), 4);
+}
+
+#[test]
+fn trailing_slash_families_keep_original_variants_and_do_not_imply_live_equality() {
+    let fixture=Fixture::json(json!([
+        "https://example.test/account/settings",
+        "https://example.test/en-US/account/settings/",
+        "https://example.test/fr-FR/account/settings///"
+    ]));
+    let report=document(&fixture.run(&["--all"]));
+    assert_eq!(report["total"],1);
+    let row=&report["rows"][0];
+    assert_eq!(cell(&report,row,"route"),"/account/settings");
+    assert_eq!(cell(&report,row,"count"),3);
+    assert_eq!(cell(&report,row,"inferred_count"),3);
+    assert_eq!(cell(&report,row,"asserted_live_count"),0);
+    let paths:Vec<_>=cell(&report,row,"variants").as_array().unwrap().iter().map(|variant|variant["path"].as_str().unwrap()).collect();
+    assert!(paths.contains(&"/en-US/account/settings/"));
+    assert!(paths.contains(&"/fr-FR/account/settings///"));
+}
+
+#[test]
+fn symbol_only_literals_do_not_hide_numeric_ids_or_supported_navigation() {
+    let fixture=Fixture::json(json!([
+        "https://example.test/$", "https://example.test/&",
+        "https://example.test/123",
+        {"url":"https://example.test/$","kind":"observed_live"},
+        {"url":"https://example.test/&","kind":"html_anchor"},
+        {"url":"https://example.test/undefined","kind":"observed_live"}
+    ]));
+    let report=document(&fixture.run(&["--all"]));
+    assert_eq!(report["stats"]["noise"],2);
+    assert_eq!(report["stats"]["route"],4);
+    let rows=report["rows"].as_array().unwrap();
+    for route in ["/$","/&","/:param","/undefined"] {
+        assert!(rows.iter().any(|row|cell(&report,row,"class")=="route" && cell(&report,row,"route")==route));
+    }
 }

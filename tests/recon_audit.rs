@@ -555,3 +555,33 @@ fn projection_validates_input_bounds_before_producing_output() {
     input.select.status = vec![0];
     assert!(projected_records(&input, &records).is_err());
 }
+
+#[test]
+fn capture_metadata_exposes_provider_timeout_and_byte_counts_without_raw_streams() {
+    let entries = [
+        ("request","request",json!({"tool":"recon_urls","input":{},"source":"typed_tool_request"})),
+        ("command_capture","tool_observation",json!({"provider":"wayback","stdout_bytes":0,"stderr_bytes":143,
+            "timed_out":true,"stdout_base64":"","stderr_base64":"raw-private-capture"})),
+        ("failure","failure",json!({"error":"archive timed out"}))
+    ];
+    let mut records = Vec::new();
+    let mut previous = ZERO.to_owned();
+    for (index,(kind,class,data)) in entries.into_iter().enumerate() {
+        let chunks = transport(&event(index as u64+1,&previous,kind,class,data),records.len()+1);
+        previous = chunks[0]["RECON_HASH"].as_str().unwrap().into();
+        records.extend(chunks);
+    }
+    let mut input = projection_input();
+    input.select.kind = vec!["command_capture".into()];
+    let output = projected_records(&input,&records).unwrap();
+    let capture = &output["events"][0];
+    assert_eq!(capture["provider"],"wayback");
+    assert_eq!(capture["stdout_bytes"],0);
+    assert_eq!(capture["stderr_bytes"],143);
+    assert_eq!(capture["timed_out"],true);
+    assert_eq!(output["status"],"failure");
+    assert_eq!(output["run_events"],3);
+    assert_eq!(output["events_total"],1);
+    assert!(capture.get("data").is_none());
+    assert!(!output.to_string().contains("raw-private-capture"));
+}

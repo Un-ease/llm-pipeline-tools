@@ -8,7 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -18,6 +18,27 @@ use url::Url;
 
 const OUTPUT_BUDGET: usize = 8 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const GAU_CONFIG: &str = "timeout = 10\nretries = 0\nthreads = 1\n";
+
+struct GauConfig { path: PathBuf }
+impl GauConfig {
+    fn new() -> Result<Self> { Self::create_in(&std::env::temp_dir()) }
+    fn create_in(directory: &Path) -> Result<Self> {
+        let mut random = [0u8; 16];
+        std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut random))
+            .map_err(|error| format!("gau configuration randomness: {error}"))?;
+        let path = directory.join(format!("recon-gau-{:032x}.toml", u128::from_le_bytes(random)));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .open(&path).map_err(|error| format!("cannot create private gau configuration: {error}"))?;
+        let config = Self { path };
+        file.write_all(GAU_CONFIG.as_bytes()).map_err(|error| format!("cannot write gau configuration: {error}"))?;
+        Ok(config)
+    }
+}
+impl Drop for GauConfig {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); }
+}
+
 const MAX_PAGES: usize = 32;
 const MAX_ASSETS: usize = 8;
 const MAX_VISITED: usize = 4096;
@@ -25,40 +46,74 @@ const MAX_DEPTH: usize = 2;
 static LAST_CRAWL_REQUEST: Mutex<Option<Instant>> = Mutex::new(None);
 
 #[derive(Clone, Copy)]
-enum Backend { Subfinder, Gau, Dnsx }
+pub(crate) enum ArchiveProvider { Wayback, CommonCrawl }
+impl ArchiveProvider {
+    const ALL: [Self; 2] = [Self::Wayback, Self::CommonCrawl];
+    fn name(self) -> &'static str {
+        match self { Self::Wayback => "wayback", Self::CommonCrawl => "commoncrawl" }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Backend { Subfinder, Gau(ArchiveProvider), Dnsx }
 
 impl Backend {
     fn name(self) -> &'static str {
-        match self { Self::Subfinder => "subfinder", Self::Gau => "gau", Self::Dnsx => "dnsx" }
+        match self { Self::Subfinder => "subfinder", Self::Gau(_) => "gau", Self::Dnsx => "dnsx" }
     }
     fn environment(self) -> &'static str {
-        match self { Self::Subfinder => "RECON_SUBFINDER", Self::Gau => "RECON_GAU", Self::Dnsx => "RECON_DNSX" }
+        match self { Self::Subfinder => "RECON_SUBFINDER", Self::Gau(_) => "RECON_GAU", Self::Dnsx => "RECON_DNSX" }
     }
-    fn args(self, domain: Option<&Domain>) -> Vec<OsString> {
-        let args: Vec<&str> = match self {
+    fn args(self, domain: Option<&Domain>, config: Option<&Path>) -> Vec<OsString> {
+        match self {
             // Leave one minute for provider shutdown before the 120-second supervisor deadline.
-            Self::Subfinder => vec!["-d", domain.expect("sealed subfinder input").as_str(), "-silent", "-nc", "-duc", "-oJ", "-cs", "-timeout", "10", "-max-time", "1", "-rl", "2", "-rsr", "1048576"],
-            Self::Gau => vec!["--subs", "--threads", "1", "--timeout", "10", "--retries", "0", "--providers", "wayback,commoncrawl", domain.expect("sealed gau input").as_str()],
-            Self::Dnsx => vec!["-silent", "-json", "-a", "-aaaa", "-cname", "-rcode", "noerror,nxdomain,servfail,refused", "-rl", "2", "-t", "1", "-retry", "1", "-timeout", "5s", "-duc"],
-        };
-        args.into_iter().map(OsString::from).collect()
+            Self::Subfinder => ["-d", domain.expect("sealed subfinder input").as_str(), "-silent", "-nc", "-duc", "-oJ", "-cs", "-timeout", "10", "-max-time", "1", "-rl", "2", "-rsr", "1048576"]
+                .into_iter().map(OsString::from).collect(),
+            Self::Gau(provider) => vec![
+                "--config".into(), config.expect("sealed gau configuration").as_os_str().to_owned(),
+                "--subs".into(), "--providers".into(), provider.name().into(), "--verbose".into(),
+                domain.expect("sealed gau input").as_str().into(),
+            ],
+            Self::Dnsx => ["-silent", "-json", "-a", "-aaaa", "-cname", "-rcode", "noerror,nxdomain,servfail,refused", "-rl", "2", "-t", "1", "-retry", "1", "-timeout", "5s", "-duc"]
+                .into_iter().map(OsString::from).collect(),
+        }
+    }
+    fn provider(self) -> Option<&'static str> {
+        match self { Self::Gau(provider) => Some(provider.name()), _ => None }
+    }
+    fn reported_failure(self, stderr: &[u8]) -> Option<&'static str> {
+        if !matches!(self, Self::Gau(_)) { return None; }
+        // Verbose mode exposes gau's provider warnings even when it exits zero.
+        // A config fallback is unsafe here: every gau command gets our own file.
+        for line in String::from_utf8_lossy(stderr).lines() {
+            if !["level=warning", "level=error", "level=fatal"].iter().any(|level| line.contains(level)) { continue; }
+            if line.contains("error reading config:") { return Some("backend_configuration_error"); }
+            if line.contains(" provider=") || line.contains("error instantiating commoncrawl:") {
+                return Some("provider_reported_error");
+            }
+        }
+        None
     }
 }
 
 pub(crate) enum BackendInput<'a> {
     Subdomains(&'a Domain),
-    Urls(&'a Domain),
+    Urls(&'a Domain, ArchiveProvider, &'a Path),
     Resolve(&'a [Host]),
 }
 
 pub(crate) struct CommandOutput {
     pub stdout: Vec<u8>,
     pub partial: Option<PartialInfo>,
+    pub captured_bytes: usize,
 }
 
-enum BackendFailure { Operational(String), Evidence(String) }
+#[derive(Debug)]
+enum BackendFailure { Operational(String), Interrupted(PartialInfo), Evidence(String) }
 impl BackendFailure {
-    fn message(self) -> String { match self { Self::Operational(error) | Self::Evidence(error) => error } }
+    fn message(self) -> String {
+        match self { Self::Operational(error) | Self::Evidence(error) => error, Self::Interrupted(partial) => partial.error }
+    }
 }
 
 fn executable(path: &Path) -> bool {
@@ -279,21 +334,26 @@ fn capture_command(path: &Path, args: &[OsString], input: &[u8], timeout: Durati
     Ok(capture)
 }
 
-fn captured_output(backend: Backend, mut capture: Capture) -> Result<CommandOutput> {
-    if capture.succeeded() { return Ok(CommandOutput { stdout: capture.stdout, partial: None }); }
-    let error = format!("{} failed: exit={:?}, signal={:?}, timeout={}, output_overflow={}, errors={:?}", backend.name(),
-        capture.status.and_then(|s|s.code()), capture.status.and_then(|s|s.signal()), capture.timed_out, capture.output_overflow, capture.errors);
+fn captured_output(backend: Backend, mut capture: Capture) -> std::result::Result<CommandOutput, PartialInfo> {
+    let captured_bytes = capture.stdout.len() + capture.stderr.len();
+    let reported_failure = backend.reported_failure(&capture.stderr);
+    if capture.succeeded() && reported_failure.is_none() {
+        return Ok(CommandOutput { stdout: capture.stdout, partial: None, captured_bytes });
+    }
+    let error = format!("{} failed: provider={:?}, exit={:?}, signal={:?}, timeout={}, output_overflow={}, stdout_bytes={}, stderr_bytes={}, reported_failure={:?}, errors={:?}",
+        backend.name(), backend.provider(), capture.status.and_then(|s|s.code()), capture.status.and_then(|s|s.signal()),
+        capture.timed_out, capture.output_overflow, capture.stdout.len(), capture.stderr.len(), reported_failure, capture.errors);
     let parsed_bytes = capture.stdout.iter().rposition(|byte| *byte == b'\n').map_or(0, |index| index + 1);
-    if !capture.stdout[..parsed_bytes].iter().any(|byte| !byte.is_ascii_whitespace()) { return Err(error); }
     let partial = PartialInfo {
         error, cutoff_reason: if capture.timed_out { "timeout" } else if capture.output_overflow { "output_budget" }
-            else if !capture.errors.is_empty() { "io_failure" } else { "backend_exit" }.into(),
-        captured_bytes: capture.stdout.len() + capture.stderr.len(), parsed_bytes,
+            else if !capture.errors.is_empty() { "io_failure" } else { reported_failure.unwrap_or("backend_exit") }.into(),
+        captured_bytes, parsed_bytes,
         discarded_tail_bytes: capture.stdout.len() - parsed_bytes,
         backend_exit: capture.status.and_then(|s|s.code()), backend_signal: capture.status.and_then(|s|s.signal()),
     };
+    if !capture.stdout[..parsed_bytes].iter().any(|byte| !byte.is_ascii_whitespace()) { return Err(partial); }
     capture.stdout.truncate(parsed_bytes);
-    Ok(CommandOutput { stdout: capture.stdout, partial: Some(partial) })
+    Ok(CommandOutput { stdout: capture.stdout, partial: Some(partial), captured_bytes })
 }
 
 pub(crate) fn command_output(input: BackendInput<'_>, audit: &Audit) -> Result<CommandOutput> {
@@ -301,14 +361,14 @@ pub(crate) fn command_output(input: BackendInput<'_>, audit: &Audit) -> Result<C
 }
 
 fn command_output_classified(input: BackendInput<'_>, audit: &Audit) -> std::result::Result<CommandOutput, BackendFailure> {
-    let (backend, domain, stdin) = match input {
-        BackendInput::Subdomains(domain) => (Backend::Subfinder, Some(domain), Vec::new()),
-        BackendInput::Urls(domain) => (Backend::Gau, Some(domain), Vec::new()),
+    let (backend, domain, stdin, config) = match input {
+        BackendInput::Subdomains(domain) => (Backend::Subfinder, Some(domain), Vec::new(), None),
+        BackendInput::Urls(domain, provider, config) => (Backend::Gau(provider), Some(domain), Vec::new(), Some(config)),
         BackendInput::Resolve(hosts) => {
             if hosts.is_empty() || hosts.len() > 512 { return Err(BackendFailure::Operational("dnsx requires 1..512 validated hosts".into())); }
             let mut bytes = Vec::new();
             for host in hosts { bytes.extend_from_slice(host.as_str().as_bytes()); bytes.push(b'\n'); }
-            (Backend::Dnsx, None, bytes)
+            (Backend::Dnsx, None, bytes, None)
         }
     };
     let path = match resolve_backend(backend) {
@@ -318,10 +378,10 @@ fn command_output_classified(input: BackendInput<'_>, audit: &Audit) -> std::res
             return Err(BackendFailure::Operational(error));
         }
     };
-    let args = backend.args(domain);
+    let args = backend.args(domain, config);
     let argv: Vec<&OsStr> = std::iter::once(path.as_os_str()).chain(args.iter().map(OsString::as_os_str)).collect();
     audit.record("command_intent", json!({"evidence_type":"command_execution", "backend":backend.name(),
-        "argv":argv.iter().map(|arg|arg.to_string_lossy()).collect::<Vec<_>>(),
+        "provider":backend.provider(), "argv":argv.iter().map(|arg|arg.to_string_lossy()).collect::<Vec<_>>(),
         "argv_base64":argv.iter().map(|arg|STANDARD.encode(arg.as_bytes())).collect::<Vec<_>>(),
         "stdin":if stdin.is_empty() {"closed"} else {"validated_host_lines"}, "stdin_base64":STANDARD.encode(&stdin),
         "shell":false, "timeout_seconds":COMMAND_TIMEOUT.as_secs(), "combined_output_budget_bytes":OUTPUT_BUDGET})).map_err(BackendFailure::Evidence)?;
@@ -333,8 +393,10 @@ fn command_output_classified(input: BackendInput<'_>, audit: &Audit) -> std::res
         }
     };
     // Always journal the entire retained capture, including the incomplete record.
-    audit.record("command_capture", capture.evidence()).map_err(BackendFailure::Evidence)?;
-    captured_output(backend, capture).map_err(BackendFailure::Operational)
+    let mut evidence = capture.evidence();
+    if let Some(provider) = backend.provider() { evidence["provider"] = json!(provider); }
+    audit.record("command_capture", evidence).map_err(BackendFailure::Evidence)?;
+    captured_output(backend, capture).map_err(BackendFailure::Interrupted)
 }
 
 struct Parsed {
@@ -411,7 +473,7 @@ fn parse_urls(bytes: &[u8], domain: &Domain) -> Result<Parsed> {
             Err(error) => rejected.push(json!({"line":index+1,"reason":"invalid_url","error":error})),
         }
     }
-    Ok(Parsed { observations: json!({"evidence_type":"historical_archive_discovery", "asserted_live":false, "providers":["wayback","commoncrawl"],"records":records,"accepted":items,"duplicates":duplicates,"discarded":rejected}), items })
+    Ok(Parsed { observations: json!({"evidence_type":"historical_archive_discovery", "asserted_live":false, "records":records,"accepted":items,"duplicates":duplicates,"discarded":rejected}), items })
 }
 
 fn filter_passive(parsed: &mut Parsed, mut permits: impl FnMut(&str) -> bool, urls: bool) -> usize {
@@ -905,13 +967,100 @@ fn queue_limit() -> Result<usize> {
     }
 }
 
-fn archive(domain: &Domain, policy: &Policy, audit: &Audit) -> std::result::Result<(Parsed, Option<PartialInfo>, usize), BackendFailure> {
-    let output = command_output_classified(BackendInput::Urls(domain),audit)?;
-    let mut parsed = parse_urls(&output.stdout,domain).map_err(BackendFailure::Operational)?;
-    let excluded = filter_passive(&mut parsed,|host|policy.permits_host(host),true);
-    audit.record("archive_url_discovery",std::mem::take(&mut parsed.observations)).map_err(BackendFailure::Evidence)?;
-    require_partial_items(&parsed,&output.partial).map_err(BackendFailure::Operational)?;
-    Ok((parsed,output.partial,excluded))
+struct ArchiveOutcome {
+    items: BTreeSet<String>,
+    partial: Option<PartialInfo>,
+    partial_provider: Option<&'static str>,
+    excluded: usize,
+    providers: Vec<Value>,
+}
+
+fn retain_archive_partial(outcome: &mut ArchiveOutcome, provider: ArchiveProvider, partial: PartialInfo) {
+    if outcome.partial.as_ref().is_none_or(|old| old.captured_bytes == 0 && partial.captured_bytes > 0) {
+        outcome.partial_provider = Some(provider.name());
+    }
+    merge_partial(&mut outcome.partial, partial);
+}
+
+fn collect_archives(
+    domain: &Domain, mut permits: impl FnMut(&str) -> bool,
+    stages: impl IntoIterator<Item = (ArchiveProvider, std::result::Result<CommandOutput, BackendFailure>)>,
+    mut record: impl FnMut(&str, &Value) -> Result<()>,
+) -> std::result::Result<ArchiveOutcome, BackendFailure> {
+    let mut outcome = ArchiveOutcome { items:BTreeSet::new(), partial:None, partial_provider:None, excluded:0, providers:Vec::with_capacity(2) };
+    for (provider, stage) in stages {
+        let prepared = (|| -> std::result::Result<_, BackendFailure> {
+            let mut output = stage?;
+            let mut parsed = parse_urls(&output.stdout, domain).map_err(|error| {
+                let mut partial = output.partial.take().unwrap_or_else(|| PartialInfo {
+                    error:String::new(), cutoff_reason:"invalid_archive_output".into(),
+                    captured_bytes:output.captured_bytes, parsed_bytes:0, discarded_tail_bytes:0,
+                    backend_exit:Some(0), backend_signal:None,
+                });
+                if !partial.error.is_empty() { partial.error.push_str("; "); }
+                partial.error.push_str(&format!("{} output: {error}", provider.name()));
+                BackendFailure::Interrupted(partial)
+            })?;
+            let excluded = filter_passive(&mut parsed, &mut permits, true);
+            parsed.observations["providers"] = json!([provider.name()]);
+            record("archive_url_discovery", &parsed.observations).map_err(BackendFailure::Evidence)?;
+            Ok((parsed.items, output.partial, excluded))
+        })();
+        let summary = match prepared {
+            Ok((items, partial, excluded)) => {
+                let summary = json!({"provider":provider.name(), "completed":partial.is_none(),
+                    "accepted":items.len(), "policy_excluded":excluded, "partial":partial});
+                outcome.items.extend(items);
+                outcome.excluded += excluded;
+                if let Some(partial) = partial { retain_archive_partial(&mut outcome, provider, partial); }
+                summary
+            }
+            Err(BackendFailure::Evidence(error)) => return Err(BackendFailure::Evidence(error)),
+            Err(error) => {
+                let partial = match error {
+                    BackendFailure::Interrupted(partial) => partial,
+                    error => workflow_partial(format!("{}: {}", provider.name(), error.message()), "archive_provider_failed"),
+                };
+                let summary = json!({"provider":provider.name(), "completed":false, "accepted":0, "partial":partial});
+                retain_archive_partial(&mut outcome, provider, partial);
+                summary
+            }
+        };
+        record("archive_provider_result", &summary).map_err(BackendFailure::Evidence)?;
+        outcome.providers.push(summary);
+    }
+    Ok(outcome)
+}
+
+fn archive(domain: &Domain, policy: &Policy, audit: &Audit) -> std::result::Result<ArchiveOutcome, BackendFailure> {
+    let config = match GauConfig::new() {
+        Ok(config) => config,
+        Err(error) => {
+            audit.record("command_configuration_failed", json!({"backend":"gau","error":error})).map_err(BackendFailure::Evidence)?;
+            return Err(BackendFailure::Operational(error));
+        }
+    };
+    audit.record("command_configuration", json!({"backend":"gau","format":"toml","source":"tool_owned_ephemeral_configuration",
+        "path":config.path.to_string_lossy(),"path_base64":STANDARD.encode(config.path.as_os_str().as_bytes()),
+        "content":GAU_CONFIG,"sha256":crate::sha256(GAU_CONFIG.as_bytes())})).map_err(BackendFailure::Evidence)?;
+    let config_path = config.path.as_path();
+    // Provider initialization must not prevent the other source from starting.
+    // Each process retains the existing 120-second / 8-MiB supervision limits.
+    let stages = std::thread::scope(|scope| {
+        let workers = ArchiveProvider::ALL.map(|provider| {
+            (provider, std::thread::Builder::new().spawn_scoped(scope, move || {
+                command_output_classified(BackendInput::Urls(domain, provider, config_path), audit)
+            }))
+        });
+        workers.map(|(provider, worker)| {
+            let stage = match worker {
+                Ok(worker) => worker.join().unwrap_or_else(|_| Err(BackendFailure::Operational("archive worker panicked".into()))),
+                Err(error) => Err(BackendFailure::Operational(format!("cannot start archive worker: {error}"))),
+            };
+            (provider, stage)
+        })
+    });
+    collect_archives(domain, |host|policy.permits_host(host), stages, |kind,data|audit.record(kind,data))
 }
 
 fn merge_partial(existing: &mut Option<PartialInfo>, mut incoming: PartialInfo) {
@@ -927,21 +1076,30 @@ fn merge_partial(existing: &mut Option<PartialInfo>, mut incoming: PartialInfo) 
 }
 
 fn merge_archive(result: &mut WorkflowResult, items: &mut BTreeSet<String>, crawl_observations: usize,
-    stage: std::result::Result<(Parsed, Option<PartialInfo>, usize), BackendFailure>,
+    stage: std::result::Result<ArchiveOutcome, BackendFailure>,
     mut record: impl FnMut(&str, Value) -> Result<()>) -> Result<()> {
     match stage {
-        Ok((parsed,partial,excluded)) => {
-            result.coverage["archive"] = json!({"completed":partial.is_none(),"policy_excluded":excluded,"accepted":parsed.items.len(),"asserted_live":false});
-            items.extend(parsed.items);
-            if let Some(partial) = partial { merge_partial(&mut result.partial,partial); }
+        Ok(mut outcome) => {
+            if outcome.items.is_empty() && crawl_observations == 0
+                && let Some(partial) = outcome.partial.take() { return Err(partial.error); }
+            result.coverage["archive"] = json!({"completed":outcome.partial.is_none(),"policy_excluded":outcome.excluded,
+                "accepted":outcome.items.len(),"asserted_live":false,"providers":outcome.providers,
+                "provider_processes":2,"timeout_seconds_per_provider":COMMAND_TIMEOUT.as_secs(),
+                "output_budget_bytes_per_provider":OUTPUT_BUDGET,"partial_metadata_provider":outcome.partial_provider});
+            items.extend(outcome.items);
+            if let Some(partial) = outcome.partial { merge_partial(&mut result.partial,partial); }
         }
         Err(BackendFailure::Evidence(error)) => return Err(error),
-        Err(BackendFailure::Operational(error)) if crawl_observations > 0 => {
-            record("required_stage_failed",json!({"stage":"archive","error":error,"preserved_crawl_observations":crawl_observations}))?;
-            result.coverage["archive"] = json!({"completed":false,"required_stage_failed":true,"error":error});
-            merge_partial(&mut result.partial,workflow_partial(error,"required_archive_stage_failed"));
+        Err(error) => {
+            let partial = match error {
+                BackendFailure::Interrupted(partial) => partial,
+                error => workflow_partial(error.message(), "required_archive_stage_failed"),
+            };
+            if crawl_observations == 0 { return Err(partial.error); }
+            record("required_stage_failed",json!({"stage":"archive","error":partial.error,"preserved_crawl_observations":crawl_observations}))?;
+            result.coverage["archive"] = json!({"completed":false,"required_stage_failed":true,"error":partial.error});
+            merge_partial(&mut result.partial, partial);
         }
-        Err(BackendFailure::Operational(error)) => return Err(error),
     }
     Ok(())
 }

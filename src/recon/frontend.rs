@@ -29,7 +29,7 @@ pub fn schema(tool: &str) -> Value {
         },
         "recon_discover" => (json!({"hosts":hosts,"ports":ports,"paths":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","pattern":"^/(?!/)","maxLength":2048},"default":["/"]}}),json!(["hosts"])),
         "recon_ports" => (json!({"hosts":hosts,"ports":ports}),json!(["hosts","ports"])),
-        "recon_urls" => (json!({"domain":domain,"mode":{"type":"string","enum":["archive","crawl","combined"],"default":"archive"},"seeds":{"type":"array","maxItems":8,"default":[],"items":{"type":"string","format":"uri","maxLength":8192}},"since":run,"resume":run,"queue":checkpoint}),json!(["domain"])),
+        "recon_urls" => (json!({"domain":domain,"mode":{"type":"string","enum":["archive","crawl","combined"],"default":"archive","description":"archive: passive providers only, no seeds; crawl: bounded live navigation from seeds; combined: both stages."},"seeds":{"type":"array","maxItems":8,"default":[],"description":"Required for crawl/combined: 1-8 absolute HTTP(S) URLs within domain. Omit for archive.","items":{"type":"string","format":"uri","maxLength":8192}},"since":run,"resume":run,"queue":checkpoint}),json!(["domain"])),
         "recon_surface" => (json!({"run":run,"site":domain,"prefix":{"type":"string","pattern":"^/(?!/)","maxLength":2048,"description":"Optional route prefix to zoom into, not a URL or request target"}}),json!(["run"])),
         "evidence_read" => (json!({"run":run,"include_payloads":{"type":"boolean","default":false},"include_integrity":{"type":"boolean"},
             "select":{"type":"object","additionalProperties":false,"properties":{
@@ -51,13 +51,16 @@ pub fn schema(tool: &str) -> Value {
         ]);
     }
     if tool=="recon_urls" {
-        result["allOf"] = json!([
-            {"oneOf":[
-                {"properties":{"mode":{"const":"archive"},"seeds":{"maxItems":0}},"not":{"anyOf":[{"required":["resume"]},{"required":["queue"]}]}},
-                {"required":["mode","seeds"],"properties":{"mode":{"enum":["crawl","combined"]},"seeds":{"minItems":1}}}
-            ]},
-            {"not":{"required":["resume","queue"]}}
-        ]);
+        // Keep the typed object at the root: MCP schema renderers can turn
+        // constraint-only allOf branches into `unknown & unknown`.
+        result["if"] = json!({"properties":{"mode":{"const":"archive"}}});
+        result["then"] = json!({"properties":{"seeds":{"maxItems":0}},
+            "not":{"anyOf":[{"required":["resume"]},{"required":["queue"]}]}});
+        result["else"] = json!({"required":["mode","seeds"],
+            "properties":{"mode":{"enum":["crawl","combined"]},"seeds":{"minItems":1}}});
+        result["not"] = json!({"required":["resume","queue"]});
+        result["properties"]["resume"]["description"] = json!("Prior crawl/combined receipt; requires the original seeds. Do not combine with queue.");
+        result["properties"]["queue"]["description"] = json!("Inline crawl/combined checkpoint; requires matching seeds. Do not combine with resume.");
     }
     result
 }
@@ -303,7 +306,7 @@ fn description(tool:&str)->&str {
         "recon_subdomains"=>"Enumerate passive subdomain observations with bounded v2 rows, explicit completeness and journal receipts.",
         "recon_resolve"=>"Resolve typed hosts and return compact addresses, CNAMEs, explicit observed/unknown outcomes and operator-policy dispositions.",
         "recon_discover"=>"Discover HTTP services/content with operator scope, required research headers and private-address guards.",
-        "recon_urls"=>"Discover archived/public URLs; prioritize navigation, separately budget JS assets and resume via a prior receipt.",
+        "recon_urls"=>"Discover URLs with mode archive, crawl, or combined. Archive accepts no seeds; crawl/combined require 1-8 HTTP(S) seeds within domain. Supports bounded JavaScript collection and receipt resumption.",
         "recon_surface"=>"Summarize verified saved URL evidence into compact offline route groups; zoom by prefix without rescanning or exporting raw captures.",
         "recon_ports"=>"Check explicit integer TCP ports with operator scope/address guards and honest negative coverage.",
         "evidence_read"=>"Verify the complete journal chain, then filter/page lean observations; payloads and per-event integrity are opt-in.",

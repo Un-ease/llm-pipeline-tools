@@ -302,11 +302,15 @@ impl Verified {
                 value["hash"] = Value::String(hash);
                 value["cursor"] = Value::String(cursor);
             }
-            for key in ["url", "host"] {
+            for key in ["url", "host", "provider"] {
                 if let Some(text) = event.data.get(key).and_then(Value::as_str) {
                     value[key] = Value::String(text.into());
                 }
             }
+            for key in ["stdout_bytes", "stderr_bytes"] {
+                if let Some(bytes) = event.data.get(key).and_then(Value::as_u64) { value[key] = json!(bytes); }
+            }
+            if let Some(timed_out) = event.data.get("timed_out").and_then(Value::as_bool) { value["timed_out"] = json!(timed_out); }
             if let Some(status) = http_status(&event.data) { value["status"] = json!(status); }
             if let Some(outcome) = event.data.get("outcome").and_then(Value::as_str)
                 .or_else(|| event.data.get("status").and_then(Value::as_str)) {

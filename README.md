@@ -19,6 +19,10 @@ Rust tools for typed, audited recon workflows and compact offline evidence reduc
 
 Chain saved work by receipt: `recon_resolve` accepts `source_run` from a completed subdomain run instead of a copied host list. `recon_surface` accepts a URL-run receipt, defaults to 20 origin/path groups and supports `prefix` zoom into detailed families. It reports historical captures separately from unknown current liveness, authentication state and API operations.
 
+Archive discovery isolates Wayback and Common Crawl in separate bounded processes, preserves partial results and exposes per-provider completion. Tool-managed temporary TOML enforces gau's 10-second HTTP timeout, zero retries and one worker; verbose diagnostics expose provider errors that gau can otherwise hide. No user `.gau.toml` is required. Compact `evidence_read` previews include provider/byte/timeout metadata. See the v0.3.3 verification in [RECON.md](RECON.md).
+
+`recon_urls` modes are `archive`, `crawl`, and `combined`. Seeded requests must explicitly select `crawl`/`combined`. The input schema exposes typed fields directly so MCP clients can display the valid choices instead of an opaque root intersection.
+
 Facts go to the root-owned system journal; model verdicts are appended separately. This protects existing records against ordinary user edits, not root, journal retention, or forged new entries. See [RECON.md](RECON.md) for exact guarantees, input schemas, limits and integration.
 
 

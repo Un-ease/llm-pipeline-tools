@@ -1,6 +1,6 @@
 [package]
 name = "llm-pipeline-tools"
-version = "0.3.0"
+version = "0.3.3"
 edition = "2024"
 description = "Typed recon workflows and compact-output evidence tools"
 license = "MIT"

@@ -120,6 +120,11 @@ fn url_modes_do_not_silently_discard_or_invent_crawl_intent() {
         assert!(input.validate().is_err());
     }
     assert!(serde_json::from_value::<UrlsInput>(json!({"domain":"example.test","mode":"--shell"})).is_err());
+    for mode in ["archive","crawl","combined"] {
+        let seeds=if mode=="archive" {json!([])} else {json!(["https://example.test/"])};
+        let input:UrlsInput=serde_json::from_value(json!({"domain":"example.test","mode":mode,"seeds":seeds})).unwrap();
+        assert!(input.validate().is_ok(),"valid {mode} intent was rejected");
+    }
 }
 
 #[test]

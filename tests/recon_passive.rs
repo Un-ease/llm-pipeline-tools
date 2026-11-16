@@ -1,5 +1,5 @@
 // Exercise private pure/IO boundaries without exposing a production fixture API.
-pub use llm_pipeline_tools::Result;
+pub use llm_pipeline_tools::{Result, sha256};
 mod recon { pub use llm_pipeline_tools::recon::{audit, network, policy, result, types}; }
 #[allow(dead_code)]
 mod implementation {
@@ -105,13 +105,13 @@ not json
     fn successful_backend_can_return_a_complete_final_line_without_newline() {
         let mut capture = interrupted(b"https://example.com/no-newline");
         capture.status = Some(ExitStatus::from_raw(0));
-        let output = captured_output(Backend::Gau,capture).unwrap();
+        let output = captured_output(Backend::Gau(ArchiveProvider::Wayback),capture).unwrap();
         assert!(output.partial.is_none());
         assert_eq!(parse_urls(&output.stdout,&domain()).unwrap().items.len(),1);
     }
     #[test]
     fn dnsx_arguments_are_fixed_low_rate_and_include_explicit_negative_statuses() {
-        let args = Backend::Dnsx.args(None).into_iter().map(|arg|arg.into_string().unwrap()).collect::<Vec<_>>();
+        let args = Backend::Dnsx.args(None,None).into_iter().map(|arg|arg.into_string().unwrap()).collect::<Vec<_>>();
         for flag in ["-silent","-json","-a","-aaaa","-cname","-duc"] { assert!(args.iter().any(|arg|arg == flag)); }
         assert!(args.windows(2).any(|pair|pair == ["-rcode","noerror,nxdomain,servfail,refused"]));
         assert!(args.windows(2).any(|pair|pair == ["-rl","2"]));
@@ -424,6 +424,148 @@ not json
     fn empty_robots_directive_does_not_merge_an_unrelated_agent_group() {
         let rules = Robots::parse(b"User-agent: *\nDisallow:\nUser-agent: unrelated\nDisallow: /\n");
         assert!(rules.permits(web("/application").as_url()));
+    }
+
+    fn completed_archive(provider: ArchiveProvider, stdout: &[u8], stderr: &[u8]) -> CommandOutput {
+        let mut capture = interrupted(stdout);
+        capture.status = Some(ExitStatus::from_raw(0));
+        capture.stderr = stderr.to_vec();
+        captured_output(Backend::Gau(provider), capture).unwrap()
+    }
+
+    #[test]
+    fn one_provider_timeout_does_not_erase_the_other_sources_urls_or_capture_facts() {
+        let mut capture = interrupted(b"");
+        capture.timed_out = true;
+        capture.status = Some(ExitStatus::from_raw(libc::SIGKILL));
+        let captured_bytes = capture.stderr.len();
+        let failed = captured_output(Backend::Gau(ArchiveProvider::Wayback),capture).map_err(BackendFailure::Interrupted);
+        let completed = completed_archive(ArchiveProvider::CommonCrawl,b"https://example.com/from-commoncrawl\n",b"");
+        let outcome = collect_archives(&domain(), |_|true,
+            [(ArchiveProvider::Wayback,failed),(ArchiveProvider::CommonCrawl,Ok(completed))], |_,_|Ok(())).unwrap();
+        assert_eq!(outcome.items,BTreeSet::from(["https://example.com/from-commoncrawl".into()]));
+        assert_eq!(outcome.partial_provider,Some("wayback"));
+        let partial = outcome.partial.as_ref().unwrap();
+        assert_eq!(partial.captured_bytes,captured_bytes);
+        assert_eq!(partial.parsed_bytes,0);
+        assert_eq!(partial.backend_signal,Some(libc::SIGKILL));
+        assert_eq!(partial.cutoff_reason,"timeout");
+        let mut result = WorkflowResult::complete(Vec::new());
+        let mut items = BTreeSet::new();
+        merge_archive(&mut result,&mut items,0,Ok(outcome),|_,_|Ok(())).unwrap();
+        assert!(result.partial.is_some());
+        assert_eq!(items,BTreeSet::from(["https://example.com/from-commoncrawl".into()]));
+        assert_eq!(result.coverage["archive"]["completed"],false);
+        assert_eq!(result.coverage["archive"]["providers"][0]["completed"],false);
+        assert_eq!(result.coverage["archive"]["providers"][1]["completed"],true);
+    }
+
+    #[test]
+    fn provider_reported_errors_with_zero_exit_are_not_successful_empty_archives() {
+        for (provider, diagnostic) in [
+            (ArchiveProvider::Wayback,b"level=warning msg=\"example.com - timeout\" provider=wayback\n".as_slice()),
+            (ArchiveProvider::CommonCrawl,b"level=warning msg=\"error instantiating commoncrawl: API unavailable\"\n".as_slice())
+        ] {
+            let mut capture = interrupted(b"");
+            capture.status = Some(ExitStatus::from_raw(0));
+            capture.stderr = diagnostic.to_vec();
+            let partial = captured_output(Backend::Gau(provider),capture).err().unwrap();
+            assert_eq!(partial.backend_exit,Some(0));
+            assert_eq!(partial.cutoff_reason,"provider_reported_error");
+            assert_eq!(partial.captured_bytes,diagnostic.len());
+        }
+        let mut capture = interrupted(b"");
+        capture.status = Some(ExitStatus::from_raw(0));
+        capture.stderr = b"level=warning msg=\"error reading config: Config file missing, using default config\"\n".to_vec();
+        let partial = captured_output(Backend::Gau(ArchiveProvider::Wayback),capture).err().unwrap();
+        assert_eq!(partial.cutoff_reason,"backend_configuration_error");
+        assert_eq!(partial.backend_exit,Some(0));
+        let output = completed_archive(ArchiveProvider::Wayback,b"https://example.com/kept\n",
+            b"level=info msg=\"fetching example.com\" page=0 provider=wayback\n");
+        assert_eq!(output.stdout,b"https://example.com/kept\n");
+        assert!(output.partial.is_none());
+    }
+
+    #[test]
+    fn provider_error_retains_complete_url_lines_but_never_the_unfinished_tail() {
+        let stdout = b"https://example.com/kept\nhttps://example.com/cut";
+        let mut capture = interrupted(stdout);
+        capture.status = Some(ExitStatus::from_raw(0));
+        capture.stderr = b"level=warning msg=\"example.com - timeout\" provider=wayback\n".to_vec();
+        let output = captured_output(Backend::Gau(ArchiveProvider::Wayback),capture).unwrap();
+        assert_eq!(output.stdout,b"https://example.com/kept\n");
+        assert_eq!(output.partial.as_ref().unwrap().discarded_tail_bytes,b"https://example.com/cut".len());
+        let outcome = collect_archives(&domain(), |_|true,
+            [(ArchiveProvider::Wayback,Ok(output))], |_,_|Ok(())).unwrap();
+        assert_eq!(outcome.items,BTreeSet::from(["https://example.com/kept".into()]));
+        assert!(outcome.partial.is_some());
+    }
+
+    #[test]
+    fn unavailable_provider_plus_empty_provider_is_failure_not_a_negative_result() {
+        let empty = completed_archive(ArchiveProvider::CommonCrawl,b"",b"");
+        let outcome = collect_archives(&domain(), |_|true,
+            [(ArchiveProvider::Wayback,Err(BackendFailure::Operational("backend unavailable".into()))),
+             (ArchiveProvider::CommonCrawl,Ok(empty))], |_,_|Ok(())).unwrap();
+        let mut result = WorkflowResult::complete(Vec::new());
+        assert!(merge_archive(&mut result,&mut BTreeSet::new(),0,Ok(outcome),|_,_|Ok(())).is_err());
+        let empty = ArchiveProvider::ALL.map(|provider|(provider,Ok(completed_archive(provider,b"",b""))));
+        let outcome = collect_archives(&domain(), |_|true, empty, |_,_|Ok(())).unwrap();
+        let mut result = WorkflowResult::complete(Vec::new());
+        let mut items = BTreeSet::new();
+        merge_archive(&mut result,&mut items,0,Ok(outcome),|_,_|Ok(())).unwrap();
+        assert!(items.is_empty());
+        assert!(result.partial.is_none());
+        assert_eq!(result.coverage["archive"]["completed"],true);
+    }
+
+    #[test]
+    fn isolated_sources_deduplicate_and_apply_policy_without_inventing_provenance() {
+        let stages = [
+            (ArchiveProvider::Wayback,Ok(completed_archive(ArchiveProvider::Wayback,
+                b"https://example.com/shared\nhttps://excluded.example.com/private\n",b""))),
+            (ArchiveProvider::CommonCrawl,Ok(completed_archive(ArchiveProvider::CommonCrawl,
+                b"https://example.com/shared\nhttps://example.com/other\n",b"")))
+        ];
+        let mut sources = Vec::new();
+        let outcome = collect_archives(&domain(), |host|host != "excluded.example.com", stages,
+            |kind,data| { if kind == "archive_url_discovery" { sources.push(data["providers"].clone()); } Ok(()) }).unwrap();
+        assert_eq!(outcome.items,BTreeSet::from(["https://example.com/shared".into(),"https://example.com/other".into()]));
+        assert_eq!(outcome.excluded,1);
+        assert_eq!(sources,vec![json!(["wayback"]),json!(["commoncrawl"])]);
+        assert!(outcome.partial.is_none());
+    }
+
+    #[test]
+    fn invalid_provider_output_preserves_the_other_source_but_journal_failures_abort() {
+        let stages = [
+            (ArchiveProvider::Wayback,Ok(completed_archive(ArchiveProvider::Wayback,b"\xff\n",b""))),
+            (ArchiveProvider::CommonCrawl,Ok(completed_archive(ArchiveProvider::CommonCrawl,b"https://example.com/kept\n",b"")))
+        ];
+        let outcome = collect_archives(&domain(), |_|true, stages, |_,_|Ok(())).unwrap();
+        assert_eq!(outcome.items,BTreeSet::from(["https://example.com/kept".into()]));
+        assert_eq!(outcome.partial.as_ref().unwrap().cutoff_reason,"invalid_archive_output");
+        assert_eq!(outcome.partial.as_ref().unwrap().captured_bytes,2);
+        let stage = [(ArchiveProvider::Wayback,Ok(completed_archive(ArchiveProvider::Wayback,b"https://example.com/kept\n",b"")))];
+        assert!(matches!(collect_archives(&domain(), |_|true, stage, |_,_|Err("journal unavailable".into())),
+            Err(BackendFailure::Evidence(_))));
+    }
+
+    #[test]
+    fn managed_gau_configuration_is_private_and_cleaned_without_clobbering_files() {
+        let path;
+        {
+            let config = GauConfig::new().unwrap();
+            path = config.path.clone();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777,0o600);
+            let original = std::fs::read(&path).unwrap();
+            assert!(GauConfig::create_in(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(),original);
+            assert!(path.exists());
+        }
+        assert!(!path.exists());
     }
 }
 }

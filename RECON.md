@@ -1,6 +1,6 @@
 # Typed recon workflows
 
-Version **0.3** wraps goals, not scanner switches. Requests are typed JSON; unknown fields, malformed domains/URLs, non-integer ports and oversized workloads are rejected. `--schema` describes each input. Examples are request shapes, not authorization; replace example run IDs with actual receipts.
+Version **0.3.3** wraps goals, not scanner switches. Requests are typed JSON; unknown fields, malformed domains/URLs, non-integer ports and oversized workloads are rejected. `--schema` describes each input. Examples are request shapes, not authorization; replace example run IDs with actual receipts.
 
 ## Workflow surface
 
@@ -57,7 +57,11 @@ Refused TCP connections and observed negative DNS/HTTP responses are valid obser
 
 Discovery permits 32 hosts, 128 integer ports, 64 paths, at most 256 host/port pairs and 256 HTTP probes. Defaults are ports `[80,443]` and path `["/"]`; ports require an explicit list for TCP checks. HTTPS is used on 443/8443. TCP uses 300 ms connection timeouts/concurrency eight. This is not a SYN/UDP/banner scan or vulnerability confirmation.
 
-Subfinder/gau use fixed source/rate/time arguments and `RECON_SUBFINDER`/`RECON_GAU` absolute paths, otherwise PATH. Supervision bounds runtime to 120 seconds and captured output to 8 MiB. Command captures are not internal provider HTTP or DNS packet captures.
+Subfinder/gau use fixed source/rate/time arguments and `RECON_SUBFINDER`/`RECON_GAU` absolute paths, otherwise PATH. Each supervised command is bounded to 120 seconds and 8 MiB of combined stdout/stderr. Archive discovery runs Wayback and Common Crawl in **two isolated concurrent gau processes**, not one shared provider initialization: at most two provider commands and 16 MiB of retained raw provider streams. There are no wrapper retries. Command captures are not internal provider HTTP or DNS packet captures.
+
+Gau receives an explicit, tool-owned mode-0600 temporary TOML file setting **10-second HTTP requests, zero retries and one worker**, plus `--verbose` for provider diagnostics. The file is shared by the two provider processes and removed on normal scope exit. Exact contents, path and hash are recorded as `command_configuration`. No user `~/.gau.toml` is created or required; this is independent of optional `RECON_SCOPE`. Creation/write failure aborts before backend execution, and a gau config-read fallback is a configuration failure rather than a successful default run.
+
+Provider coverage reports completion, accepted URLs and original partial metadata separately. Either provider's URLs survive the other's failure; duplicates are merged. Recognized gau provider-error diagnostics mark the source incomplete even when gau exits zero. With managed configuration, a config-read warning means the intended settings were not loaded and is classified as `backend_configuration_error`. Incomplete sources with no usable URLs do not become successful empty results. `partial_metadata_provider` identifies the archive capture behind the representative top-level partial byte/exit/signal fields; those counters are not a sum of both captures.
 
 ## Receipt-driven saved inputs and surface views
 
@@ -71,7 +75,19 @@ Completed v1 facts remain readable, including original completion arrays; any re
 
 ## Crawl scheduling and resumption
 
-`archive` is provider-only and rejects seeds/checkpoints. `crawl` is independent of gau. `combined` requires both stages, preserving any failed stage as incomplete.
+| URL mode | Seeds | Work performed |
+|---|---|---|
+| `archive` (default) | Omit or empty; no checkpoints | Passive archive providers only. |
+| `crawl` | 1–8 HTTP(S) URLs inside `domain` | Bounded native crawling, independent of gau. |
+| `combined` | 1–8 HTTP(S) URLs inside `domain` | Both stages; a failed required stage remains incomplete. |
+
+`navigation` is a queue-entry kind, not a URL workflow mode. A seeded request must explicitly select `crawl` or `combined`; omitting `mode` selects `archive`. For example:
+
+```json
+{"domain":"example.test","mode":"crawl","seeds":["https://app.example.test/"]}
+```
+
+The published input is a directly typed root object with conditional seed/checkpoint constraints. Root `allOf` intersections previously rendered as `unknown & unknown` in MCP argument documentation, hiding the valid choices. Runtime validation remains authoritative; `resume` and `queue` are mutually exclusive.
 
 Native crawling separates **32 navigation/metadata** requests from **eight JavaScript assets**, depth two, exact seed origin including scheme/host/port. CSS/images/fonts cannot consume navigation budget. Real navigation and robots/sitemaps take priority over script literals. Templates/constants retain provenance as hints but are not blindly requested. Robots exclusions are honored. No forms, browser execution or redirects.
 
@@ -87,7 +103,7 @@ Resume reads the verified prior checkpoint internally, revalidates exact origins
 
 `evidence_read` intersects `select.kind`, `class`, numeric HTTP `status` and `seq`, then applies `offset`/`limit` (default 100, maximum 4096). An event lacking HTTP status cannot match a status filter. **The entire chain is verified before filtering**, including records outside the selected page.
 
-Responses preserve run-level hash/cursor/attribution plus `run_events`, filtered `events_total`, `events_omitted` and `next_offset`. Compact events retain sequence/kind/class/size and available URL/status/host/outcome summaries. Per-event hash/cursor default off for metadata; `include_integrity` overrides this. `include_payloads:true` is explicit, can be large and defaults integrity on. Original v1 journal facts remain readable.
+Responses preserve run-level hash/cursor/attribution plus `run_events`, filtered `events_total`, `events_omitted` and `next_offset`. Compact events retain sequence/kind/class/size and available URL/status/host/outcome summaries. Command captures also expose available provider, stdout/stderr byte counts and timeout state without raw streams. Per-event hash/cursor default off for metadata; `include_integrity` overrides this. `include_payloads:true` is explicit, can be large and defaults integrity on. Original v1 journal facts remain readable.
 
 Subdomains/URLs accept typed `since` or CLI `--since RUN`. The prior completed run must be the same workflow/domain/mode/seeds. Full snapshots remain in the journal; the presentation emits new identities with `new`/`gone`/`unchanged` counts. Partial current results or changed policy cannot establish `gone`, which becomes null. These are observation-set differences, **not live/dead claims or a freshness cache**.
 
@@ -130,6 +146,64 @@ To opt into program-file enforcement, set `RECON_SCOPE=/absolute/operator/progra
 Linux systemd-journald, `journalctl` and `libsystemd` are runtime prerequisites for audited workflows; network goals also require their applicable backends. `recon_surface` needs the journal but no scanner backend. Offline `bbp-*` reducers and `tok-log` need none of them. Builds additionally require Rust 2024 and `libsystemd-dev`; the pinned `Dockerfile.build` supports machines without a host toolchain. Binaries are not installed into PATH.
 
 After replacing binaries/configuration, run `/mcp reload` or start a new omp session. An already-running server does not inherit later environment edits.
+
+## Version 0.3.3 effective gau configuration
+
+An offline probe against the installed gau v2.2.4 module exposed the missing-config fallback bug. Its `DefaultConfig` retains 45-second HTTP requests and five retries: that path never applies the timeout flag and only updates retries when the value is positive. Provider configuration also suppresses warning-level errors unless verbose mode is enabled. The earlier missing-config warning was non-fatal, but its fallback settings were not harmless.
+
+| Effective setting | Missing config with old CLI flags | Managed file and verbose flag |
+|---|---|---|
+| HTTP timeout | 45 seconds | 10 seconds |
+| Retries | 5 | 0 |
+| Workers per provider | 1 | 1 |
+| Provider log level | Error | Info |
+
+The fix supplies an explicit temporary configuration instead of relying on those fallback flags. It does not raise the 120-second outer deadline or add retries. A clean exit with no captured warnings in older runs is not sufficient evidence of an empty provider inventory, because those warnings could have been suppressed.
+
+**68 focused tests passed**, including private-file lifecycle, configuration-error classification and retained-partial compatibility. The first attempt stopped at a test-harness missing hash export; that harness was corrected and its failure log retained. All **15 release binaries** were compiled and atomically packaged.
+
+The packaged CLI/MCP smoke passed the adapter's actual generated file and argv through gau v2.2.4's configuration parser for both providers. Each resolved to 10 seconds, zero retries, one worker and Info diagnostics. It also verified:
+
+- Private configuration exists during worker execution and is removed afterward.
+- Journal configuration bytes/hash match the parser input.
+- Partial URL results remain partial and readable by `recon_surface`.
+- Configuration creation failure records a failure before any backend invocation.
+
+All smoke URL output was synthetic; the configuration parser did not initialize providers or make HTTP requests. The reported archive query was not repeated. Public provider availability remains unverified after this fix. Logs are retained in `target/verification-v033-*.log`; temporary probe sources and executable were removed.
+
+## Version 0.3.2 schema compatibility and archive retry
+
+The URL tool now exposes `domain`, the `archive`/`crawl`/`combined` enum, seed arrays and resumption fields directly, with descriptions explaining their cross-field rules. Standard `if`/`then`/`else` constraints replace the opaque root intersection without removing archive seed restrictions or checkpoint exclusivity. No `navigation` alias was added.
+
+**33 focused tests passed.** A throwaway interoperability script checked 19 request shapes under both Draft7 and Draft202012 (**38 checks**) against the actual packaged MCP schema, and verified the CLI advertises the same schema. All **15 release binaries** were compiled and atomically packaged.
+
+One real archive-only retry for `bugcrowd.com` was made using the configured gau backend; no target-crawl stage or automatic retry followed:
+
+| Provider | Observed result |
+|---|---|
+| Wayback | Supervisor timeout/SIGKILL; zero stdout bytes. |
+| Common Crawl | Completed without a recognized provider error; zero accepted URLs. |
+
+Overall status remained **failure/incomplete coverage**, not a successful empty inventory. The workflow took 120.534 seconds; the saved receipt is `7c4eff2f26dd25a3f00843cee2c98106`. Wayback stderr contained only the non-fatal missing-config warning, so its internal stalled request remains unknown.
+
+Verification and retry summaries are retained in `target/verification-v032-*.log`; raw facts remain in the protected journal. Temporary scripts were removed. Reload MCP to refresh cached argument documentation.
+
+## Version 0.3.1 archive isolation verification
+
+The saved failure `f23d7848429d9067e995780340e834a7` contained **zero stdout bytes**, 143 stderr bytes containing only a missing-config warning, and a timeout/SIGKILL. No URLs can be recovered from those absent bytes. The captured command does not identify the stalled provider or its internal network request. Matching installed gau v2.2.4 source shows Common Crawl initialization precedes Wayback work; isolated processes remove that coupling without claiming the original stall is proven to be Common Crawl.
+
+**104 focused tests passed**, zero failed; five ignored entries are subprocess fixtures exercised by runner tests. All **15 release binaries** were compiled and atomically packaged with refreshed checksums.
+
+| Packaged CLI/MCP scenario | Observed result |
+|---|---|
+| Independent startup | Both synthetic providers passed a mutual startup barrier; neither waited for the other provider to finish. |
+| Partial source retention | One successful source plus one zero-exit provider error yielded three unique URLs; CLI showed two, omitted one and exited 3. |
+| Provider error honesty | Two providers logging errors while exiting zero produced a failure, not a successful empty inventory. |
+| Compact evidence | Both provider names and captured byte counts were readable without raw payloads; the original combined run retained no invented provider label. |
+| Downstream surface | A derived surface preserved the original partial facts and remained partial. |
+| Network activity | Synthetic local processes and saved-journal reads only; no archive provider or target queries. |
+
+Raw captures remain unchanged in the protected journal. Verification output is in `target/verification-v031-*.log`; the smoke scripts were removed. Actual public-provider availability was not retested.
 
 ## Version 0.3 verification
 
